@@ -1,0 +1,1301 @@
+package com.example.deepseekstandalone
+
+import android.util.Log
+import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+import java.io.InputStream
+import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
+
+interface ServerHandler {
+    fun isApiEnabled(): Boolean
+    fun isLoggedIn(): Boolean
+    /**
+     * Transport state for /status.
+     *
+     * This build has no tunnel: clients talk to 127.0.0.1 directly, so there is
+     * nothing to connect. The key stays because the web UI's health check reads
+     * it, and removing it would make an expected field look like a failure.
+     */
+    fun getTunnelStatus(): String = "local"
+    fun getLastError(): String?
+    fun getErrorLog(): List<String>
+    suspend fun sendPrompt(prompt: String, onChunk: (String) -> Unit): Result<Unit>
+    /** Same, with the page-level DeepThink / web-search options applied first. */
+    suspend fun sendPrompt(
+        prompt: String,
+        thinking: Boolean,
+        search: Boolean,
+        onChunk: (String) -> Unit
+    ): Result<Unit> = sendPrompt(prompt, onChunk)
+    /**
+     * The rendered answer text from the page. Used as the response body when the
+     * site's own stream does not surface its content patches to us.
+     */
+    suspend fun readRenderedAnswer(): String
+    /**
+     * The rendered DeepThink / reasoning text for the newest turn, or "" when
+     * thinking was off. Emitted as delta.reasoning_content.
+     */
+    suspend fun readRenderedReasoning(): String = ""
+    /** TEMPORARY diagnostic: live transcript structure. */
+    suspend fun debugTranscript(): String = "{}"
+    /** TEMPORARY diagnostic: innerText vs textContent for the last answer. */
+    suspend fun debugAnswerText(): String = "{}"
+    /** TEMPORARY diagnostic: raw network stream capture. */
+    suspend fun rawStreamStats(): String = "{}"
+    /** TEMPORARY diagnostic: is the network hook installed? */
+    suspend fun hookPresence(): String = "{}"
+    /**
+     * Full answer text reconstructed from the raw stream, or "" if none.
+     *
+     * Preferred over scraping: it comes from the same bytes the page received,
+     * so it cannot return an older turn or a half-rendered paragraph.
+     */
+    suspend fun streamedAnswerText(): String = ""
+    /** Same, for the DeepThink text. */
+    suspend fun streamedReasoningText(): String = ""
+    /** Record parsed text so the finished answer can be rebuilt from the wire. */
+    fun noteStreamedText(text: String, isReasoning: Boolean) {}
+    /**
+     * Ask the user whether to fall back to scraping the page.
+     *
+     * Returns true to proceed, false to fail the request instead. Implementations
+     * should show a prompt; the default declines, because a silent DOM read is
+     * how stale answers were previously returned.
+     */
+    suspend fun confirmDomFallback(reason: String): Boolean = false
+    /** Click the site's stop control and abandon the in-flight completion. */
+    suspend fun stopGeneration(): Boolean
+    /** True when the page is showing a bot/human verification overlay. */
+    suspend fun isVerificationShowing(): Boolean
+    /** Reload the page to clear that overlay. Does not bypass it. */
+    suspend fun reloadAndWait(): Boolean
+}
+
+class LocalHttpServer(
+    host: String = "127.0.0.1",
+    port: Int = 8080,
+    private val scope: CoroutineScope,
+    private val handler: ServerHandler,
+    private val onErrorLogged: (String) -> Unit
+) : NanoHTTPD(host, port) {
+
+    override fun serve(session: IHTTPSession): Response {
+        val uri = session.uri
+        val method = session.method
+
+        // Answer CORS preflight before dispatch.
+        //
+        // In the tunnelled build the Cloudflare Worker added these headers, so
+        // the local server never needed them. Here the browser page calls
+        // 127.0.0.1 directly, which is cross-origin: without a preflight
+        // response and an allow-origin header the fetch is blocked and every
+        // request fails before it is sent.
+        if (method == Method.OPTIONS) {
+            return withCors(newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", ""))
+        }
+
+        return withCors(dispatch(session, uri, method))
+    }
+
+    private fun dispatch(session: IHTTPSession, uri: String, method: Method): Response {
+        return when {
+            uri == "/chat" && method == Method.POST -> handleChat(session)
+            (uri == "/coding/chat/completions" || uri == "/general/chat/completions") && method == Method.POST -> handleChatCompletions(session)
+            // Non-streaming: one JSON response with the finished text.
+            //
+            // Streaming sends one SSE frame per token. A client that renders
+            // each frame individually is slow and can be overwhelmed by a long
+            // answer, so these return the assembled text once, when generation
+            // has actually finished.
+            uri == "/chat/full" && method == Method.POST -> handleChatFull(session, openAiShape = false)
+            (uri == "/coding/chat/completions/full" || uri == "/general/chat/completions/full") &&
+                method == Method.POST -> handleChatFull(session, openAiShape = true)
+            uri == "/status" && method == Method.GET -> handleStatus()
+            // Stop the in-flight generation in the page.
+            uri == "/stop" && (method == Method.POST || method == Method.GET) -> handleStop()
+            uri == "/errors" && method == Method.GET -> handleErrors()
+            else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "Not found"))
+        }
+    }
+
+    /**
+     * Non-streaming completion: run the turn to completion, return the text once.
+     *
+     * Nothing is written to the client until the page stops generating, so the
+     * response is a single JSON document. Deltas are still consumed internally
+     * (that is how progress and the answer are observed) but are not forwarded,
+     * which is what keeps a long answer from arriving as hundreds of frames.
+     */
+    private fun handleChatFull(session: IHTTPSession, openAiShape: Boolean): Response {
+        if (!handler.isApiEnabled()) {
+            return jsonResponse(
+                Response.Status.SERVICE_UNAVAILABLE,
+                JSONObject().put("error", JSONObject().put("message", "API service disabled"))
+            )
+        }
+        if (!handler.isLoggedIn()) {
+            return jsonResponse(
+                Response.Status.UNAUTHORIZED,
+                JSONObject().put("error", JSONObject().put("message", "Not logged in"))
+            )
+        }
+
+        val bodyMap = HashMap<String, String>()
+        try {
+            session.parseBody(bodyMap)
+        } catch (e: Exception) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", JSONObject().put("message", "Failed to parse body: ${e.message}"))
+            )
+        }
+
+        val postData = bodyMap["postData"] ?: ""
+        val jsonReq = try { JSONObject(postData) } catch (e: Exception) { JSONObject() }
+
+        // Accept the simple {"prompt": "..."} form and the OpenAI messages form.
+        val prompt = jsonReq.optString("prompt", "").ifBlank {
+            val messages = jsonReq.optJSONArray("messages")
+            if (messages != null && messages.length() > 0) {
+                messages.getJSONObject(messages.length() - 1).optString("content", "")
+            } else ""
+        }
+        if (prompt.isBlank()) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", JSONObject().put("message", "Missing or empty prompt"))
+            )
+        }
+
+        // Accept "stream" for shape compatibility but always answer in one piece.
+        val wantReasoning = jsonReq.optBoolean("include_reasoning", false)
+        val model = jsonReq.optString("model", "deepseek-web")
+
+        var answer = StringBuilder()
+        var reasoning = StringBuilder()
+
+        // Reset per-turn parser state.
+        //
+        // This only happened on the OpenAI-shaped endpoint, so the plain
+        // handlers inherited the previous turn's fragment types: the opening
+        // append of a new turn inherited the old THINK flag and the model's
+        // reasoning was emitted as answer text.
+        resetFragmentTracking()
+
+        val result = runBlocking {
+            try {
+                withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
+                    handler.sendPrompt(prompt) { chunk ->
+                        val (text, isReasoning) = extractDelta(chunk)
+                        if (text.isEmpty()) return@sendPrompt
+                        if (isReasoning) reasoning.append(text) else answer.append(text)
+                    }
+                } ?: Result.failure(Exception("Timed out after ${REQUEST_TIMEOUT_MS / 1000}s"))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+        // The stream can finish while the page is still settling; the
+        // accumulated wire text is the authoritative finished answer.
+        var finalAnswer = answer.toString()
+        var finalReasoning = reasoning.toString()
+        if (finalAnswer.isBlank() || finalReasoning.isBlank()) {
+            val (wireAnswer, wireReasoning) = runBlocking {
+                val a = try { handler.streamedAnswerText() } catch (e: Exception) { "" }
+                val r = try { handler.streamedReasoningText() } catch (e: Exception) { "" }
+                a to r
+            }
+            if (finalAnswer.isBlank()) finalAnswer = wireAnswer
+            if (finalReasoning.isBlank()) finalReasoning = wireReasoning
+        }
+
+        if (finalAnswer.isBlank()) {
+            val msg = result.exceptionOrNull()?.message
+                ?: "No content arrived on the network stream. This usually means DeepSeek " +
+                    "throttled the request - retry shortly."
+            onErrorLogged("/full: no content ($msg)")
+            return jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("error", JSONObject().put("message", msg))
+            )
+        }
+
+        val payload = if (openAiShape) {
+            JSONObject().apply {
+                put("id", "chatcmpl-" + UUID.randomUUID().toString())
+                put("object", "chat.completion")
+                put("created", System.currentTimeMillis() / 1000)
+                put("model", model)
+                put(
+                    "choices",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("index", 0)
+                            put(
+                                "message",
+                                JSONObject().apply {
+                                    put("role", "assistant")
+                                    put("content", finalAnswer)
+                                    if (wantReasoning && finalReasoning.isNotBlank()) {
+                                        put("reasoning_content", finalReasoning)
+                                    }
+                                }
+                            )
+                            put("finish_reason", "stop")
+                        }
+                    )
+                )
+            }
+        } else {
+            JSONObject().apply {
+                put("content", finalAnswer)
+                if (wantReasoning && finalReasoning.isNotBlank()) {
+                    put("reasoning_content", finalReasoning)
+                }
+            }
+        }
+
+        return jsonResponse(Response.Status.OK, payload)
+    }
+
+    /**
+     * Allow the GitHub-hosted UI to call this server.
+     *
+     * "*" is deliberate: the server only listens on 127.0.0.1, so only software
+     * already running on this device can reach it, and the page origin varies
+     * (github.io, a local file, a dev server).
+     */
+    private fun <T : Response> withCors(response: T): T = response.apply {
+        addHeader("Access-Control-Allow-Origin", "*")
+        addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+        addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        addHeader("Access-Control-Max-Age", "86400")
+    }
+
+    /** Write one OpenAI-style delta chunk. Shared by both chat endpoints. */
+    private fun emitChunk(
+        pipe: StreamPipe,
+        chunkId: String,
+        kind: String,
+        value: String
+    ) {
+        val obj = JSONObject().apply {
+            put("id", chunkId)
+            put("object", "chat.completion.chunk")
+            put("created", System.currentTimeMillis() / 1000)
+            put("choices", JSONArray().put(
+                JSONObject().apply {
+                    put("index", 0)
+                    put("delta", JSONObject().put(kind, value))
+                    put("finish_reason", JSONObject.NULL)
+                }
+            ))
+        }
+        pipe.write("data: $obj\n\n".toByteArray(Charsets.UTF_8))
+    }
+
+    private fun handleChat(session: IHTTPSession): Response {
+        if (!handler.isApiEnabled()) {
+            return jsonResponse(Response.Status.SERVICE_UNAVAILABLE, JSONObject().put("error", "API service disabled"))
+        }
+
+        if (!handler.isLoggedIn()) {
+            return jsonResponse(Response.Status.UNAUTHORIZED, JSONObject().put("error", "Not logged in"))
+        }
+
+        val bodyMap = HashMap<String, String>()
+        try {
+            session.parseBody(bodyMap)
+        } catch (e: Exception) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "Failed to parse body: ${e.message}"))
+        }
+
+        val postData = bodyMap["postData"] ?: ""
+        val prompt = try {
+            JSONObject(postData).optString("prompt", "")
+        } catch (e: Exception) {
+            ""
+        }
+
+        if (prompt.isBlank()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "Missing or empty prompt"))
+        }
+
+        val pipe = StreamPipe()
+        val chunkId = "chatcmpl-" + UUID.randomUUID().toString()
+
+        // Reset per-turn parser state; see handleChatFull for why.
+        resetFragmentTracking()
+
+        scope.launch(Dispatchers.IO) {
+            try {
+                // Route the raw patches through the SAME parser the
+                // OpenAI-compatible endpoint uses.
+                //
+                // This handler previously wrote each captured payload verbatim
+                // ("data: " + raw). The hook now captures the site's own
+                // JSON-Patch frames, so the client received protocol noise
+                // ("{\"p\":\"response/fragments/-1/content\",...}") instead of
+                // an answer - and never a delta.content at all.
+                var emittedAny = false
+                var reasoningSeen = false
+                val patchReasoning = StringBuilder()
+
+                val result = handler.sendPrompt(prompt) { chunk ->
+                    val (text, isReasoning) = extractDelta(chunk)
+                    if (text.isEmpty()) return@sendPrompt
+
+                    if (isReasoning) {
+                        patchReasoning.append(text)
+                        emitChunk(pipe, chunkId, "reasoning_content", text)
+                    } else {
+                        emitChunk(pipe, chunkId, "content", text)
+                    }
+                    emittedAny = true
+                    reasoningSeen = reasoningSeen || isReasoning
+                }
+
+                if (result.isSuccess) {
+                    // Nothing parsed from the live stream: rebuild the finished
+                    // answer from the wire text we accumulated, which avoids the
+                    // DOM entirely and cannot return an older turn.
+                    if (!emittedAny) {
+                        val full = try { handler.streamedAnswerText() } catch (e: Exception) { "" }
+                        if (full.isNotBlank()) {
+                            onErrorLogged("/chat: recovered ${full.length} chars from the stream")
+                            val r = try { handler.streamedReasoningText() } catch (e: Exception) { "" }
+                            if (r.isNotBlank()) emitChunk(pipe, chunkId, "reasoning_content", r)
+                            emitChunk(pipe, chunkId, "content", full)
+                            emittedAny = true
+                        }
+                    }
+                    if (!emittedAny) {
+                        onErrorLogged("/chat: no content on the stream for this message")
+                        val errJson = JSONObject().put(
+                            "error",
+                            JSONObject().put(
+                                "message",
+                                "No content arrived on the network stream. This usually " +
+                                    "means DeepSeek throttled the request - retry shortly."
+                            )
+                        ).toString()
+                        pipe.write("data: $errJson\n\n".toByteArray(Charsets.UTF_8))
+                    }
+                    pipe.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+                } else {
+                    val errMsg = result.exceptionOrNull()?.message ?: "Send failed"
+                    val errJson = JSONObject().put("error", errMsg).toString()
+                    pipe.write("data: $errJson\n\n".toByteArray(Charsets.UTF_8))
+                }
+            } catch (e: Exception) {
+                onErrorLogged("Server send error: ${e.message}")
+            } finally {
+                pipe.finish()
+            }
+        }
+
+        val response = newChunkedResponse(Response.Status.OK, "text/event-stream", pipe)
+        response.addHeader("Cache-Control", "no-cache")
+        response.addHeader("Connection", "keep-alive")
+        return response
+    }
+
+    private fun handleChatCompletions(session: IHTTPSession): Response {
+        if (!handler.isApiEnabled()) {
+            return jsonResponse(Response.Status.SERVICE_UNAVAILABLE, JSONObject().put("error", JSONObject().put("message", "API service disabled")))
+        }
+
+        if (!handler.isLoggedIn()) {
+            return jsonResponse(Response.Status.UNAUTHORIZED, JSONObject().put("error", JSONObject().put("message", "Not logged in")))
+        }
+
+        val bodyMap = HashMap<String, String>()
+        try {
+            session.parseBody(bodyMap)
+        } catch (e: Exception) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", JSONObject().put("message", "Failed to parse body: ${e.message}")))
+        }
+
+        val postData = bodyMap["postData"] ?: ""
+        val jsonReq = try {
+            JSONObject(postData)
+        } catch (e: Exception) {
+            JSONObject()
+        }
+
+        val model = jsonReq.optString("model", "glm-5.3")
+        val thinkingObj = jsonReq.optJSONObject("thinking")
+        val thinkingEnabled = thinkingObj?.optString("type")?.equals("enabled", ignoreCase = true) == true
+        val searchEnabled = jsonReq.optJSONObject("search")
+            ?.optBoolean("enabled", false) == true
+        val messages = jsonReq.optJSONArray("messages")
+
+        val (prompt, hasUser) = parseMessagesToPrompt(messages)
+        if (!hasUser || prompt.isBlank()) {
+            return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", JSONObject().put("message", "No user message found")))
+        }
+
+        val pipe = StreamPipe()
+
+        scope.launch(Dispatchers.IO) {
+            val chunkId = "chatcmpl-" + UUID.randomUUID().toString()
+            var emittedAny = false
+
+            // Reasoning seen in the completion patches. Preferred over the DOM
+            // because it belongs to this exact turn.
+            val patchReasoning = StringBuilder()
+
+            // Temporary: parser accounting so a silent rejection is visible.
+            var rawSeen = 0
+            var parsedOk = 0
+            val parseSamples = ArrayList<String>()
+
+            fun emit(kind: String, value: String) {
+                val obj = JSONObject().apply {
+                    put("id", chunkId)
+                    put("object", "chat.completion.chunk")
+                    put("created", System.currentTimeMillis() / 1000)
+                    put("model", model)
+                    val deltaObj = JSONObject().put(kind, value)
+                    val choiceObj = JSONObject().apply {
+                        put("index", 0)
+                        put("delta", deltaObj)
+                        put("finish_reason", JSONObject.NULL)
+                    }
+                    put("choices", JSONArray().put(choiceObj))
+                }
+                pipe.write("data: $obj\n\n".toByteArray(Charsets.UTF_8))
+                emittedAny = true
+            }
+
+            try {
+                // Fresh fragment bookkeeping for this turn, otherwise the
+                // previous request's fragment types leak into this one.
+                resetFragmentTracking()
+
+                // Clear a stuck verification overlay BEFORE sending. Checking
+                // only after the send is too late: the Worker allows 60s for the
+                // first frame, and a doomed attempt burns that budget, so the
+                // retry can never deliver.
+                if (handler.isVerificationShowing()) {
+                    onErrorLogged("Verification overlay already present; reloading first")
+                    handler.reloadAndWait()
+                }
+
+                // Snapshot the transcript BEFORE sending.
+                //
+                // With the document-start hook this is now only a SAFETY NET:
+                // the stream normally supplies the text, and the DOM is read
+                // only if the stream produced nothing. The snapshot still
+                // matters for that fallback, because the page keeps previous
+                // turns mounted and a naive read returns the older answer.
+                val answerBefore = try { handler.readRenderedAnswer() } catch (e: Exception) { "" }
+                val reasoningBefore = try { handler.readRenderedReasoning() } catch (e: Exception) { "" }
+
+                var result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled) { chunk ->
+                    rawSeen++
+                    val (text, isReasoning) = extractDelta(chunk)
+                    if (text.isNotEmpty()) {
+                        parsedOk++
+                        // Accumulate so the finished text is available even if
+                        // the client disconnects or deltas were dropped.
+                        handler.noteStreamedText(text, isReasoning && thinkingEnabled)
+                        if (isReasoning && thinkingEnabled) {
+                            // Remember it so the fallback path below does not
+                            // have to go to the DOM for reasoning.
+                            patchReasoning.append(text)
+                            emit("reasoning_content", text)
+                        } else {
+                            emit("content", text)
+                        }
+                    } else if (parseSamples.size < 6) {
+                        // Keep a few unparsed payloads so the failure is visible.
+                        parseSamples.add(chunk.take(110))
+                    }
+                }
+
+                // The stream produced nothing: fall back to the finished text
+                // rebuilt from the wire, and only then ask about scraping.
+                // (See below.)
+
+                // The stream is the primary source; the hook also accumulates
+                // the full text, which is used here instead of scraping the
+                // page. Scraping is a last resort and asks first.
+                var rendered = ""
+                if (result.isSuccess && !emittedAny) {
+                    // Preferred recovery: the raw bytes we already captured.
+                    val fromStream = try { handler.streamedAnswerText() } catch (e: Exception) { "" }
+                    if (fromStream.isNotBlank()) {
+                        onErrorLogged("Using ${fromStream.length} chars reconstructed from the raw stream")
+                        emit("content", fromStream)
+                    } else {
+                        val reason = "No content arrived on the network stream for this message."
+                        onErrorLogged("Stream produced no content; asking before DOM fallback")
+                        val proceed = try { handler.confirmDomFallback(reason) }
+                        catch (e: Exception) { false }
+
+                        if (proceed) {
+                            onErrorLogged("User approved DOM fallback")
+                            rendered = readRenderedWithWait(answerBefore)
+                        } else {
+                            val errObj = JSONObject().put(
+                                "error",
+                                JSONObject().put(
+                                    "message",
+                                    "No content on the network stream, and the page-scraping " +
+                                        "fallback was declined. This is usually DeepSeek " +
+                                        "throttling the request - wait a moment and retry."
+                                )
+                            )
+                            pipe.write("data: ${errObj}\n\n".toByteArray(Charsets.UTF_8))
+                            pipe.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+                            return@launch
+                        }
+                    }
+                }
+
+                // A verification interstitial is often transient. Reload the page
+                // once and resend rather than failing immediately. This never
+                // attempts to solve or bypass the check - it only clears the
+                // stuck overlay so the user can complete it if it returns.
+                if (result.isSuccess && !emittedAny && isChallengeText(rendered)) {
+                    onErrorLogged("Verification overlay detected; reloading and retrying once")
+                    val ready = try { handler.reloadAndWait() } catch (e: Exception) { false }
+                    if (ready && !handler.isVerificationShowing()) {
+                        result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled) { chunk ->
+                            val (text, isReasoning) = extractDelta(chunk)
+                            if (text.isNotEmpty()) {
+                                if (isReasoning && thinkingEnabled) emit("reasoning_content", text)
+                                else emit("content", text)
+                            }
+                        }
+                        if (result.isSuccess && !emittedAny) {
+                            // The page was reloaded, so the transcript is being
+                            // rebuilt; the pre-send snapshot no longer applies.
+                            // Take a fresh baseline of the PREVIOUS turn (the
+                            // page shows history after a reload) and wait for it
+                            // to change.
+                            kotlinx.coroutines.delay(500L)
+                            val baseline = try { handler.readRenderedAnswer() }
+                            catch (e: Exception) { "" }
+                            rendered = readRenderedWithWait(baseline)
+                        }
+                    }
+                }
+
+                if (result.isSuccess && !emittedAny) {
+                    if (isChallengeText(rendered)) {
+                        // Still blocked: the check needs a human. Reporting it as
+                        // content would be worse than failing.
+                        onErrorLogged("Blocked by site verification: $rendered")
+                        val errObj = JSONObject().put(
+                            "error",
+                            JSONObject().put(
+                                "message",
+                                "DeepSeek is showing a verification prompt. Open the " +
+                                    "bridge app on the phone, complete the check on the " +
+                                    "page, then send again."
+                            )
+                        )
+                        pipe.write("data: ${errObj}\n\n".toByteArray(Charsets.UTF_8))
+                        pipe.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+                        return@launch
+                    }
+
+                    // Emit the reasoning BEFORE the answer, matching how
+                    // reasoning models stream: thinking first, then content.
+                    // Some clients render them as separate blocks and would
+                    // otherwise show an empty thought panel.
+                    if (thinkingEnabled) {
+                        // Prefer the thinking scraped from the completion
+                        // patches; the DOM is only a fallback. This avoids the
+                        // virtual-list problems that made DOM reads return an
+                        // earlier turn's content.
+                        var reasoning = patchReasoning.toString()
+                        if (reasoning.isBlank()) {
+                            // Same settle rule as the answer: the thinking panel
+                            // also fills progressively, so taking the first
+                            // change yielded a truncated prefix.
+                            // Budget: the Worker drops the request at 60s, so
+                            // this wait must leave room for the answer read
+                            // that follows. 25s is ample for a thinking panel.
+                            var lastThink = ""
+                            var lastThinkChange = 0L
+                            val rDeadline = System.currentTimeMillis() + 25_000L
+                            while (System.currentTimeMillis() < rDeadline) {
+                                val cur = try { handler.readRenderedReasoning() }
+                                catch (e: Exception) {
+                                    onErrorLogged("Failed to read rendered reasoning: ${e.message}")
+                                    ""
+                                }
+                                if (cur.isNotBlank() && cur != reasoningBefore) {
+                                    if (cur != lastThink) {
+                                        lastThink = cur
+                                        lastThinkChange = System.currentTimeMillis()
+                                    } else if (System.currentTimeMillis() - lastThinkChange >= SETTLE_MS) {
+                                        reasoning = cur
+                                        break
+                                    }
+                                }
+                                kotlinx.coroutines.delay(300L)
+                            }
+                            // A still-growing prefix is better than nothing.
+                            if (reasoning.isBlank() && lastThink.isNotBlank() &&
+                                lastThink != reasoningBefore
+                            ) {
+                                reasoning = lastThink
+                            }
+                        }
+                        if (reasoning.isNotBlank() && !isChallengeText(reasoning)) {
+                            emit("reasoning_content", reasoning)
+                        }
+                    }
+
+                    // The answer itself. This MUST be emitted: an earlier edit
+                    // replaced this line with the empty-answer guard below,
+                    // which silently dropped every response while reasoning
+                    // still streamed - the "reasoning perfect, responses empty"
+                    // symptom.
+                    if (rendered.isNotBlank()) {
+                        emit("content", rendered)
+                    } else {
+                        // Report what the page actually showed, so a silent
+                        // empty reply is diagnosable from /errors alone.
+                        val nowRaw = try { handler.readRenderedAnswer() } catch (e: Exception) { "" }
+                        onErrorLogged(
+                            "No answer text: before=" + answerBefore.take(40) +
+                                " | now=" + nowRaw.take(40) +
+                                " | emittedAny=" + emittedAny
+                        )
+                    }
+                }
+
+                if (result.isSuccess) {
+                    val finalChunkObj = JSONObject().apply {
+                        put("id", chunkId)
+                        put("object", "chat.completion.chunk")
+                        put("created", System.currentTimeMillis() / 1000)
+                        put("model", model)
+                        val choiceObj = JSONObject().apply {
+                            put("index", 0)
+                            put("delta", JSONObject())
+                            put("finish_reason", "stop")
+                        }
+                        put("choices", JSONArray().put(choiceObj))
+                    }
+                    pipe.write("data: ${finalChunkObj.toString()}\n\n".toByteArray(Charsets.UTF_8))
+                } else {
+                    val errMsg = result.exceptionOrNull()?.message ?: "Send failed"
+                    val errObj = JSONObject().put("error", JSONObject().put("message", errMsg))
+                    pipe.write("data: ${errObj.toString()}\n\n".toByteArray(Charsets.UTF_8))
+                }
+                pipe.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+            } catch (e: Exception) {
+                onErrorLogged("Server send error: ${e.message}")
+                try {
+                    val errObj = JSONObject().put("error", JSONObject().put("message", e.message ?: "Unknown error"))
+                    pipe.write("data: ${errObj.toString()}\n\n".toByteArray(Charsets.UTF_8))
+                    pipe.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+                } catch (ignored: Exception) {}
+            } finally {
+                pipe.finish()
+            }
+        }
+
+        val response = newChunkedResponse(Response.Status.OK, "text/event-stream", pipe)
+        response.addHeader("Cache-Control", "no-cache")
+        response.addHeader("Connection", "keep-alive")
+        return response
+    }
+
+    /**
+     * Poll the rendered answer until it DIFFERS from the pre-send snapshot.
+     *
+     * Waiting merely for a non-empty value was the one-turn-behind bug: the
+     * previous turn's answer is already mounted and non-empty, so the very
+     * first poll matched it and the caller received stale text. A changed value
+     * is what proves the page rendered a reply to the message we just sent.
+     */
+    private suspend fun readRenderedWithWait(previous: String): String {
+        // The Worker closes the stream at 60s. Stay inside that: return the
+        // best complete answer we have rather than being cut off mid-wait.
+        val deadline = System.currentTimeMillis() + 175_000L
+        var last = ""
+        var lastChangedAt = 0L
+        var attempts = 0
+
+        // The page writes the answer progressively, so the first non-empty read
+        // is only a PREFIX. Returning on the first change truncated every long
+        // reply. Instead, wait until the text stops growing for a short settle
+        // window, then take the final value.
+        while (System.currentTimeMillis() < deadline) {
+            attempts++
+            val answer = try { handler.readRenderedAnswer() }
+            catch (e: Exception) {
+                onErrorLogged("Failed to read rendered answer: ${e.message}")
+                ""
+            }
+
+            if (answer.isNotBlank() && answer != previous) {
+                if (answer != last) {
+                    // Still growing.
+                    last = answer
+                    lastChangedAt = System.currentTimeMillis()
+                } else if (System.currentTimeMillis() - lastChangedAt >= SETTLE_MS) {
+                    // Unchanged for the settle window: generation has finished.
+                    return answer
+                }
+            }
+            kotlinx.coroutines.delay(300L)
+        }
+
+        // Timed out. Returning a prefix is better than nothing, but say so.
+        if (last.isNotBlank() && last != previous) {
+            onErrorLogged(
+                "Answer still growing at timeout after ${attempts} polls; " +
+                    "returning ${last.length} chars"
+            )
+            return last
+        }
+        onErrorLogged(
+            "Answer did not change after ${attempts} polls (possible upstream failure)"
+        )
+        return ""
+    }
+
+    private companion object {
+        /**
+         * How long the answer text must stay unchanged before we treat it as
+         * complete. Long replies stream for many seconds; without this we
+         * returned whatever prefix had rendered at the first poll.
+         */
+        const val SETTLE_MS = 1_500L
+
+        /**
+         * Ceiling for a non-streaming turn.
+         *
+         * The client is waiting on one response, so this has to cover the whole
+         * generation. The Worker allows 180s; staying under that means a slow
+         * answer surfaces as this handler's own error rather than a broken
+         * connection.
+         */
+        const val REQUEST_TIMEOUT_MS = 170_000L
+    }
+
+    /** Reasoning fragments live under a `thinking` path. */
+    private fun isReasoningPath(path: String): Boolean =
+        path.contains("thinking", ignoreCase = true) || path.contains("reasoning", ignoreCase = true)
+
+    /**
+     * Point the "current fragment" at the one named by a /content path.
+     *
+     * Bare appends that follow carry no path, so they inherit this. Without it
+     * the answer kept inheriting the THINK flag from the reasoning fragment
+     * that preceded it.
+     */
+    private fun updateLastFragmentFrom(path: String) {
+        val m = Regex("/fragments/(-?\\d+)/").find(path) ?: return
+        val raw = m.groupValues[1].toIntOrNull() ?: return
+        val key = if (raw < 0) (fragmentIsThink.keys.maxOrNull() ?: return) else raw
+        fragmentIsThink[key]?.let { lastFragmentWasThink = it }
+    }
+
+    /** Record fragment types from an APPEND-ed fragment array. */
+    private fun rememberFragmentArray(fragments: JSONArray) {
+        for (i in 0 until fragments.length()) {
+            val fragment = fragments.optJSONObject(i) ?: continue
+            val id = fragment.optInt("id", i)
+            fragmentIsThink[id] = isThinkFragment(fragment)
+            // A newly appended fragment becomes the current one.
+            lastFragmentWasThink = isThinkFragment(fragment)
+        }
+    }
+
+    /**
+     * Pull answer text out of a full/initial state object such as
+     * {"response":{"fragments":[{"type":"RESPONSE","content":"t"}]}}.
+     * Only the initial snapshot usually carries text this way; later fragments
+     * arrive as APPEND patches.
+     */
+    private fun extractFromState(state: JSONObject): String {
+        val response = state.optJSONObject("response") ?: return ""
+        val fragments = response.optJSONArray("fragments") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until fragments.length()) {
+            val fragment = fragments.optJSONObject(i) ?: continue
+            if (isThinkFragment(fragment)) continue // surfaced as reasoning
+            val content = fragment.optString("content", "")
+            if (content.isNotEmpty()) sb.append(content)
+        }
+        return sb.toString()
+    }
+
+    /**
+     * True when a fragment is the model's thinking rather than its answer.
+     *
+     * The live protocol uses type "THINK". The earlier "THINKING"/"REASONING"
+     * spellings are kept because the field has changed across site versions -
+     * missing "THINK" let reasoning text leak into the answer body.
+     */
+    private fun isThinkFragment(fragment: JSONObject): Boolean {
+        val type = fragment.optString("type", "")
+        return type.equals("THINK", ignoreCase = true) ||
+            type.equals("THINKING", ignoreCase = true) ||
+            type.equals("REASONING", ignoreCase = true)
+    }
+
+    /**
+     * Collect the thinking text from a state snapshot, for use as
+     * reasoning_content.
+     */
+    private fun extractThinkingFromState(state: JSONObject): String {
+        val response = state.optJSONObject("response") ?: return ""
+        val fragments = response.optJSONArray("fragments") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until fragments.length()) {
+            val fragment = fragments.optJSONObject(i) ?: continue
+            if (!isThinkFragment(fragment)) continue
+            val content = fragment.optString("content", "")
+            if (content.isNotEmpty()) sb.append(content)
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Handle DeepSeek's JSON-Patch framings, which carry the real answer text.
+     *
+     * Shapes seen in the live stream:
+     *   {"p":"response/fragments/-1/content","o":"APPEND","v":"text"}
+     *   {"v":{"response":{"fragments":[{"id":2,"type":"THINK","content":"We"}]}}}
+     *   {"v":" works"}                      <- bare append to the last path
+     *   {"p":"response/status","o":"SET","v":"FINISHED"}
+     *
+     * Returns (text, isReasoning). Empty text means "not answer content".
+     *
+     * The fragment id matters: a patch targeting a fragment we have already
+     * classified as THINK must stay reasoning even when the path alone does not
+     * say so, which is why the type is tracked per index.
+     */
+    private fun extractPatch(parsed: JSONObject): Pair<String, Boolean> {
+        val path = parsed.optString("p", "")
+        val op = parsed.optString("o", "")
+
+        if (path.isNotEmpty()) {
+            // A brand-new fragment is announced as
+            //   {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE",...}]}
+            // This is the ONLY place the type is stated, so it must be recorded
+            // or everything after it is misclassified. The object also carries
+            // the fragment's FIRST text ("content":"Hello"), so that seed has
+            // to be emitted too - dropping it lost the opening word of every
+            // answer.
+            if (path == "response/fragments" && op.equals("APPEND", ignoreCase = true)) {
+                val arr = parsed.opt("v")
+                if (arr is JSONArray) {
+                    rememberFragmentArray(arr)
+                    val sb = StringBuilder()
+                    var anyThink = false
+                    for (i in 0 until arr.length()) {
+                        val fragment = arr.optJSONObject(i) ?: continue
+                        val c = fragment.optString("content", "")
+                        if (c.isEmpty()) continue
+                        if (isThinkFragment(fragment)) anyThink = true else sb.append(c)
+                    }
+                    val seeded = sb.toString()
+                    if (seeded.isNotEmpty()) return Pair(seeded, false)
+                    if (anyThink) {
+                        // A THINK seed: emit it as reasoning.
+                        val thinkBuilder = StringBuilder()
+                        for (i in 0 until arr.length()) {
+                            val fragment = arr.optJSONObject(i) ?: continue
+                            if (!isThinkFragment(fragment)) continue
+                            thinkBuilder.append(fragment.optString("content", ""))
+                        }
+                        if (thinkBuilder.isNotEmpty()) return Pair(thinkBuilder.toString(), true)
+                    }
+                }
+                return Pair("", false)
+            }
+
+            if (path.endsWith("/content")) {
+                // The append op is frequently OMITTED:
+                //   {"p":"response/fragments/-1/content","o":"APPEND","v":" need"}
+                //   {"p":"response/fragments/-1/content","v":"!"}
+                // Requiring "APPEND" dropped the second form and every bare
+                // append that followed it.
+                val isAppend = op.isEmpty() || op.equals("APPEND", ignoreCase = true)
+                if (!isAppend) return Pair("", false)
+
+                val value = parsed.opt("v")
+                if (value is String && value.isNotEmpty()) {
+                    val reasoning = isReasoningPath(path) || isKnownThinkPath(path)
+                    // Keep the "current fragment" pointer in step with the
+                    // path, so the bare appends that follow are attributed to
+                    // the same fragment.
+                    updateLastFragmentFrom(path)
+                    return Pair(value, reasoning)
+                }
+            }
+            return Pair("", false)
+        }
+
+        // No path: either a bare append, or a full state snapshot.
+        //
+        // A snapshot is NOT necessarily the turn we asked for. The site
+        // re-sends the whole message tree, so harvesting fragments from every
+        // snapshot replayed the PREVIOUS answer (ask "5*5", get "64" back from
+        // the earlier turn). Only the message whose id we are waiting on may
+        // contribute text.
+        if (op.isEmpty()) {
+            val value = parsed.opt("v")
+            if (value is String) {
+                if (value.isEmpty()) return Pair("", false)
+                // A bare append continues the fragment named by the last
+                // /content path we saw; its type decides content vs reasoning.
+                //
+                // Do NOT gate this on currentMessageId. That id is only set if a
+                // state snapshot happened to expose message_id in the exact
+                // shape we expect, and when it did not, every bare append - the
+                // answer text itself - was discarded, so the stream parsed to
+                // nothing. The snapshot guard below still prevents replaying an
+                // older turn, which is the case that actually mattered.
+                return Pair(value, lastFragmentWasThink)
+            }
+            if (value is JSONObject) {
+                val response = value.optJSONObject("response")
+                val msgId = response?.opt("message_id")?.toString()
+                    ?: response?.opt("id")?.toString()
+
+                // First snapshot of this turn fixes which message is ours.
+                if (msgId != null && currentMessageId == null) {
+                    currentMessageId = msgId
+                }
+                // Ignore snapshots for any other message.
+                if (msgId != null && msgId != currentMessageId) {
+                    return Pair("", false)
+                }
+
+                rememberFragmentTypes(value)
+                val thinking = extractThinkingFromState(value)
+                if (thinking.isNotEmpty()) return Pair(thinking, true)
+                return Pair(extractFromState(value), false)
+            }
+        }
+        return Pair("", false)
+    }
+
+    /**
+     * The assistant message id we are currently streaming.
+     *
+     * Set from the first state snapshot that carries one, and cleared per
+     * request, so older messages in the tree cannot be mistaken for the answer
+     * to the current prompt.
+     */
+    private var currentMessageId: String? = null
+
+    /** fragment index -> true when that fragment is thinking. */
+    private val fragmentIsThink = HashMap<Int, Boolean>()
+
+    /** True when the last fragment we saw was thinking. */
+    private var lastFragmentWasThink: Boolean = false
+
+    /** Record the type of every fragment in a snapshot. */
+    private fun rememberFragmentTypes(state: JSONObject) {
+        val response = state.optJSONObject("response") ?: return
+        val fragments = response.optJSONArray("fragments") ?: return
+        for (i in 0 until fragments.length()) {
+            val fragment = fragments.optJSONObject(i) ?: continue
+            // Key by the fragment's own id, not its array position. The live
+            // payload is {"id":2,"type":"THINK",...} and patch paths reference
+            // that id ("/fragments/2/content"), so an index-keyed map
+            // misattributes text when the list order shifts.
+            val id = fragment.optInt("id", i)
+            fragmentIsThink[id] = isThinkFragment(fragment)
+        }
+        // The "last" fragment is the one subsequent bare appends belong to.
+        if (fragments.length() > 0) {
+            val last = fragments.optJSONObject(fragments.length() - 1)
+            if (last != null) lastFragmentWasThink = isThinkFragment(last)
+        }
+    }
+
+    /**
+     * Resolve ".../fragments/<n>/content" against the recorded types.
+     * "-1" means the newest fragment, which is the last id we recorded.
+     */
+    private fun isKnownThinkPath(path: String): Boolean {
+        val m = Regex("/fragments/(-?\\d+)/").find(path) ?: return false
+        val raw = m.groupValues[1].toIntOrNull() ?: return false
+        val key = if (raw < 0) (fragmentIsThink.keys.maxOrNull() ?: return false) else raw
+        return fragmentIsThink[key] == true
+    }
+
+    /** Clear per-request fragment state before each completion. */
+    private fun resetFragmentTracking() {
+        fragmentIsThink.clear()
+        lastFragmentWasThink = false
+        currentMessageId = null
+    }
+
+    /**
+     * Text the site shows instead of an answer when it wants a human check.
+     * These must never be forwarded as model output.
+     */
+    private fun isChallengeText(text: String): Boolean {
+        if (text.isBlank()) return false
+        val t = text.lowercase()
+        return t.contains("one more step") ||
+            t.contains("before you proceed") ||
+            t.contains("verify you are human") ||
+            t.contains("verification") ||
+            t.contains("unusual traffic") ||
+            t.contains("captcha")
+    }
+
+    private fun extractContentText(contentObj: Any?): String {
+        if (contentObj == null) return ""
+        if (contentObj is String) return contentObj
+        if (contentObj is JSONArray) {
+            val sb = StringBuilder()
+            for (i in 0 until contentObj.length()) {
+                val part = contentObj.optJSONObject(i) ?: continue
+                val type = part.optString("type", "text")
+                if (type == "text") {
+                    sb.append(part.optString("text", ""))
+                }
+            }
+            return sb.toString()
+        }
+        return contentObj.toString()
+    }
+
+    private fun parseMessagesToPrompt(messages: JSONArray?): Pair<String, Boolean> {
+        if (messages == null || messages.length() == 0) return Pair("", false)
+        // Only the most recent user message is sent. The web UI keeps the
+        // thread's context itself, so replaying the transcript would just
+        // paste the whole conversation back into the input box.
+        for (i in messages.length() - 1 downTo 0) {
+            val msg = messages.optJSONObject(i) ?: continue
+            if (!msg.optString("role", "").equals("user", ignoreCase = true)) continue
+            val text = extractContentText(msg.opt("content"))
+            if (text.isNotBlank()) return Pair(text, true)
+        }
+        return Pair("", false)
+    }
+
+    /**
+     * The DeepSeek web UI does not stream OpenAI chunks. It streams JSON Patch
+     * operations against its own message tree, for example:
+     *
+     *   {"p":"response/fragments/-1/content","o":"APPEND","v":"unnel"}
+     *   {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"t"}]}}}
+     *   {"v":" works"}                       <- bare append to the last path
+     *   {"p":"response/status","o":"SET","v":"FINISHED"}
+     *
+     * Only APPENDs to a `.../content` path carry answer text; everything else
+     * is bookkeeping and must be dropped.
+     */
+    private fun extractDelta(chunk: String): Pair<String, Boolean> {
+        val parsed = try {
+            JSONObject(chunk)
+        } catch (e: Exception) {
+            // Not JSON at all: the bridge handed us plain text, so use it as-is.
+            return Pair(chunk, false)
+        }
+
+        // ---- DeepSeek JSON Patch protocol --------------------------------
+        // Delegated so the fragment-id bookkeeping lives in one place.
+        val path = parsed.optString("p", "")
+        val op = parsed.optString("o", "")
+        if (path.isNotEmpty() || op.isEmpty()) {
+            val (text, reasoning) = extractPatch(parsed)
+            if (text.isNotEmpty()) return Pair(text, reasoning)
+            // A path that carried no content is protocol bookkeeping; anything
+            // else may still be an OpenAI-shaped payload from another host.
+            if (path.isNotEmpty()) return Pair("", false)
+        }
+
+        // ---- OpenAI-compatible shapes (kept as a fallback) ----------------
+        val choices = parsed.optJSONArray("choices")
+        if (choices != null && choices.length() > 0) {
+            val choice = choices.optJSONObject(0)
+            val delta = choice?.optJSONObject("delta")
+            if (delta != null) {
+                val reasoning = delta.optString("reasoning_content", "")
+                if (reasoning.isNotEmpty()) {
+                    return Pair(reasoning, true)
+                }
+                val content = delta.optString("content", "")
+                if (content.isNotEmpty()) {
+                    return Pair(content, false)
+                }
+            }
+
+            val message = choice?.optJSONObject("message")
+            if (message != null) {
+                val content = extractContentText(message.opt("content"))
+                if (content.isNotEmpty()) {
+                    return Pair(content, false)
+                }
+                val reasoning = message.optString("reasoning_content", "")
+                if (reasoning.isNotEmpty()) {
+                    return Pair(reasoning, true)
+                }
+            }
+        }
+
+        // A legacy text-completion payload.
+        val text = parsed.optString("text", "")
+        if (text.isNotEmpty()) {
+            return Pair(text, false)
+        }
+
+        // It *is* JSON but carries no content we understand (a role-only first
+        // chunk, a usage-only chunk, a finish chunk). Returning the raw JSON
+        // here would splatter protocol text into the middle of the answer, so
+        // report "nothing" and let the caller skip it.
+        return Pair("", false)
+    }
+
+    /** Wraps extractPatch so a parse failure cannot abort the stream. */
+    private fun extractPatchVerdict(parsed: JSONObject, raw: String): Pair<String, Boolean> =
+        runCatching { extractPatch(parsed) }.getOrElse { Pair("", false) }
+
+    /** Stop whatever the page is currently generating. */
+    private fun handleStop(): Response {
+        val ok = runBlocking {
+            try { withTimeoutOrNull(8_000L) { handler.stopGeneration() } ?: false }
+            catch (e: Exception) { false }
+        }
+        return jsonResponse(
+            Response.Status.OK,
+            JSONObject().put("stopped", ok)
+        )
+    }
+
+    private fun handleStatus(): Response {
+        val json = JSONObject().apply {
+            put("api_enabled", handler.isApiEnabled())
+            put("tunnel", handler.getTunnelStatus())
+            put("last_error", handler.getLastError() ?: JSONObject.NULL)
+        }
+        return jsonResponse(Response.Status.OK, json)
+    }
+
+    private fun handleErrors(): Response {
+        val array = JSONArray()
+        handler.getErrorLog().forEach { array.put(it) }
+        return jsonResponse(Response.Status.OK, array)
+    }
+
+    private fun jsonResponse(status: Response.Status, body: Any): Response {
+        val response = newFixedLengthResponse(status, "application/json", body.toString())
+        return response
+    }
+}
+
+object LogUtils {
+    fun e(tag: String, msg: String) {
+        Log.e(tag, msg)
+    }
+}
+
+/**
+ * A streaming InputStream fed from a coroutine, used as the body of a chunked
+ * NanoHTTPD response.
+ *
+ * This replaces java.io.PipedInputStream. That class has a fixed 1024-byte
+ * circular buffer and per-thread read/write bookkeeping, and when the write
+ * side is closed while a read is still outstanding the reader sees a
+ * premature end of body. NanoHTTPD reads the body from its own worker thread
+ * while the app writes from a coroutine on Dispatchers.IO, so the reader
+ * reported:
+ *
+ *     Unexpected end of stream on http://127.0.0.1:8080/...
+ *
+ * A LinkedBlockingQueue gives the same producer/consumer handoff with no
+ * thread affinity, no fixed buffer, and a clean end-of-stream signal.
+ *
+ * Thread safety: [write] and [finish] may be called from any thread. A single
+ * reader thread should call [read].
+ */
+class StreamPipe : InputStream() {
+    private sealed interface Item {
+        class Data(val bytes: ByteArray) : Item
+        data object End : Item
+    }
+
+    private val queue = LinkedBlockingQueue<Item>()
+    private val singleByte = ByteArray(1)
+    private var pending: ByteArray? = null
+    private var pendingOffset = 0
+
+    @Volatile
+    private var closed = false
+
+    /** Queue a chunk of body bytes. Never blocks. */
+    fun write(bytes: ByteArray) {
+        if (closed) return
+        queue.add(Item.Data(bytes))
+    }
+
+    /** Signal end of body. Idempotent; replaces PipedOutputStream.close(). */
+    fun finish() {
+        queue.add(Item.End)
+    }
+
+    override fun read(): Int {
+        val n = read(singleByte, 0, 1)
+        return if (n <= 0) -1 else singleByte[0].toInt() and 0xFF
+    }
+
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (closed) return -1
+        if (len == 0) return 0
+
+        while (true) {
+            val current = pending
+            if (current != null) {
+                val n = minOf(len, current.size - pendingOffset)
+                System.arraycopy(current, pendingOffset, b, off, n)
+                pendingOffset += n
+                if (pendingOffset >= current.size) {
+                    pending = null
+                    pendingOffset = 0
+                }
+                return n
+            }
+
+            val item = try {
+                queue.take()
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("read interrupted", e)
+            }
+
+            when (item) {
+                is Item.End -> return -1
+                is Item.Data -> {
+                    pending = item.bytes
+                    pendingOffset = 0
+                }
+            }
+        }
+    }
+
+    override fun close() {
+        closed = true
+        queue.clear()
+        // Unblock a reader parked in take().
+        queue.add(Item.End)
+    }
+}
