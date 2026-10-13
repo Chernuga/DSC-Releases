@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Launcher background: a dark terminal panel.
+
+    Replaces the stock Android green, which read as a stock-Android app rather
+    than this one. The near-black matches the app's own UI and gives the white
+    prompt glyph enough contrast to stay legible when the icon is scaled down.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#12161C"
+        android:pathData="M0,0h108v108h-108z" />
+</vector>

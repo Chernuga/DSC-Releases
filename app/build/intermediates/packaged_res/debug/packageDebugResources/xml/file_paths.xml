@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Paths the FileProvider may serve.
+
+    Only the preview cache is exposed: workspace files that live in a linked
+    folder are opened directly from their own content:// URI, and nothing else in
+    the app's storage should be reachable by a viewer app.
+-->
+<paths>
+    <cache-path name="preview" path="preview/" />
+</paths>
