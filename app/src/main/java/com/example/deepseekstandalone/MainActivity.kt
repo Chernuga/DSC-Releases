@@ -502,6 +502,9 @@ class MainActivity : ComponentActivity(), ServerHandler {
     override suspend fun hookPresence(): String = webViewBridge?.hookPresence() ?: "{}"
     override suspend fun streamedAnswerText(): String = webViewBridge?.streamedAnswerText() ?: ""
     override suspend fun streamedReasoningText(): String = webViewBridge?.streamedReasoningText() ?: ""
+    override suspend fun isContinueOffered(): Boolean = webViewBridge?.isContinueOffered() ?: false
+    override suspend fun recoverLastAnswer(): Pair<String, String> =
+        webViewBridge?.recoverLastAnswer() ?: ("" to "")
     override fun noteStreamedText(text: String, isReasoning: Boolean) {
         webViewBridge?.noteStreamedText(text, isReasoning)
     }

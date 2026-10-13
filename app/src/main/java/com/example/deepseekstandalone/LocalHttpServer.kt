@@ -4,6 +4,8 @@ import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -62,6 +64,13 @@ interface ServerHandler {
     suspend fun streamedAnswerText(): String = ""
     /** Same, for the DeepThink text. */
     suspend fun streamedReasoningText(): String = ""
+    /**
+     * True when the page is offering a Continue control, meaning the reply was
+     * cut off for length and what was sent is a prefix.
+     */
+    suspend fun isContinueOffered(): Boolean = false
+    /** The newest assistant reply already present on the page, or "" if none. */
+    suspend fun recoverLastAnswer(): Pair<String, String> = "" to ""
     /** Record parsed text so the finished answer can be rebuilt from the wire. */
     fun noteStreamedText(text: String, isReasoning: Boolean) {}
     /**
@@ -120,11 +129,82 @@ class LocalHttpServer(
             (uri == "/coding/chat/completions/full" || uri == "/general/chat/completions/full") &&
                 method == Method.POST -> handleChatFull(session, openAiShape = true)
             uri == "/status" && method == Method.GET -> handleStatus()
+            // Recover the last reply the page already produced.
+            //
+            // For when a request failed but the answer exists on the page - a
+            // timeout, a dropped stream, a throttled call. Reading it back costs
+            // nothing and avoids spending another generation on a retry.
+            (uri == "/last" || uri == "/last/full" ||
+                uri == "/coding/chat/completions/last" ||
+                uri == "/general/chat/completions/last") &&
+                (method == Method.GET || method == Method.POST) -> handleLastResponse(uri)
             // Stop the in-flight generation in the page.
             uri == "/stop" && (method == Method.POST || method == Method.GET) -> handleStop()
             uri == "/errors" && method == Method.GET -> handleErrors()
             else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "Not found"))
         }
+    }
+
+    /**
+     * Return the most recent assistant reply that is present on the page.
+     *
+     * This does not run a completion: it copies what the page already holds and
+     * reports it in the shape the caller asked for. Nothing is sent to DeepSeek,
+     * so a client can recover from a network failure without spending a turn.
+     */
+    private fun handleLastResponse(uri: String): Response {
+        val (answer, reasoning) = runBlocking {
+            try { handler.recoverLastAnswer() } catch (e: Exception) { "" to "" }
+        }
+
+        if (answer.isBlank() && reasoning.isBlank()) {
+            return jsonResponse(
+                Response.Status.NOT_FOUND,
+                JSONObject().put(
+                    "error",
+                    JSONObject().put("message", "The page has no assistant reply to read.")
+                )
+            )
+        }
+
+        // The OpenAI-shaped routes get a chat.completion; the simple ones get
+        // {content, ...}.
+        val openAiShape = uri.contains("chat/completions")
+        val payload = if (openAiShape) {
+            JSONObject().apply {
+                put("id", "chatcmpl-" + UUID.randomUUID().toString())
+                put("object", "chat.completion")
+                put("created", System.currentTimeMillis() / 1000)
+                put("model", "deepseek-web")
+                put("x_recovered", true)
+                put(
+                    "choices",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("index", 0)
+                            put(
+                                "message",
+                                JSONObject().apply {
+                                    put("role", "assistant")
+                                    put("content", answer)
+                                    if (reasoning.isNotBlank()) put("reasoning_content", reasoning)
+                                }
+                            )
+                            put("finish_reason", "stop")
+                        }
+                    )
+                )
+            }
+        } else {
+            JSONObject().apply {
+                put("content", answer)
+                if (reasoning.isNotBlank()) put("reasoning_content", reasoning)
+                put("x_recovered", true)
+            }
+        }
+
+        onErrorLogged("/last: recovered ${answer.length} chars from the page")
+        return jsonResponse(Response.Status.OK, payload)
     }
 
     /**
@@ -191,15 +271,65 @@ class LocalHttpServer(
         // reasoning was emitted as answer text.
         resetFragmentTracking()
 
+        // Inactivity-based waiting, not a wall-clock deadline.
+        //
+        // A fixed 170s ceiling cut off long answers that were still arriving and
+        // reported them as network errors, which they were not. What indicates a
+        // dead request is silence, so the watchdog is reset every time text
+        // arrives: a slow answer may run as long as it keeps making progress,
+        // while a genuinely stalled one fails after the quiet window.
+        val lastProgressAt = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
+
+        /** Set by the watchdog when it gives up on a silent stream. */
+        var stalled = false
+        var sendResult: Result<Unit>? = null
+
         val result = runBlocking {
             try {
-                withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                    handler.sendPrompt(prompt) { chunk ->
+                // The send runs normally; a separate watchdog observes progress
+                // and cancels only when the stream has gone quiet.
+                val sendJob = launch {
+                    sendResult = handler.sendPrompt(prompt) { chunk ->
                         val (text, isReasoning) = extractDelta(chunk)
                         if (text.isEmpty()) return@sendPrompt
                         if (isReasoning) reasoning.append(text) else answer.append(text)
+                        lastProgressAt.set(System.currentTimeMillis())
                     }
-                } ?: Result.failure(Exception("Timed out after ${REQUEST_TIMEOUT_MS / 1000}s"))
+                }
+
+                val watchdog = launch {
+                    while (isActive) {
+                        delay(500L)
+                        val quietFor = System.currentTimeMillis() - lastProgressAt.get()
+                        if (quietFor >= INACTIVITY_TIMEOUT_MS) {
+                            onErrorLogged(
+                                "No output for ${INACTIVITY_TIMEOUT_MS / 1000}s; " +
+                                    "stopping and reporting the stall (not a length timeout)"
+                            )
+                            // Abandon the in-flight generation in the page too,
+                            // so it does not keep running unattended.
+                            runCatching { handler.stopGeneration() }
+                            stalled = true
+                            sendJob.cancel()
+                            return@launch
+                        }
+                    }
+                }
+
+                sendJob.join()
+                watchdog.cancel()
+
+                if (stalled) {
+                    Result.failure(
+                        Exception(
+                            "The page stopped producing output for " +
+                                "${INACTIVITY_TIMEOUT_MS / 1000}s. Any text already received " +
+                                "is kept; use the fetch button to pull the full reply."
+                        )
+                    )
+                } else {
+                    sendResult ?: Result.success(Unit)
+                }
             } catch (e: Exception) {
                 Result.failure(e)
             }
@@ -230,12 +360,33 @@ class LocalHttpServer(
             )
         }
 
+        // Ask the page whether it is still offering a Continue.
+        //
+        // DeepSeek cuts a long answer off and shows that control; the text we
+        // hold is then a prefix. Reporting it lets the client say so instead of
+        // presenting a partial answer as complete. Failure to determine this is
+        // treated as "not truncated": a spurious warning on every reply would be
+        // worse than missing one.
+        //
+        // runBlocking because handleChatFull is a plain function called from
+        // NanoHTTPD's worker thread, and this is a quick DOM query.
+        val truncated = runBlocking {
+            try { withTimeoutOrNull(5_000L) { handler.isContinueOffered() } ?: false }
+            catch (e: Exception) { false }
+        }
+        if (truncated) {
+            onErrorLogged("/full: reply was cut off; the page is offering Continue")
+        }
+
         val payload = if (openAiShape) {
             JSONObject().apply {
                 put("id", "chatcmpl-" + UUID.randomUUID().toString())
                 put("object", "chat.completion")
                 put("created", System.currentTimeMillis() / 1000)
                 put("model", model)
+                // OpenAI uses finish_reason "length" for exactly this case, so
+                // a standard client understands it without extra handling.
+                put("x_truncated", truncated)
                 put(
                     "choices",
                     JSONArray().put(
@@ -251,7 +402,7 @@ class LocalHttpServer(
                                     }
                                 }
                             )
-                            put("finish_reason", "stop")
+                            put("finish_reason", if (truncated) "length" else "stop")
                         }
                     )
                 )
@@ -262,6 +413,7 @@ class LocalHttpServer(
                 if (wantReasoning && finalReasoning.isNotBlank()) {
                     put("reasoning_content", finalReasoning)
                 }
+                put("x_truncated", truncated)
             }
         }
 
@@ -681,15 +833,24 @@ class LocalHttpServer(
                 }
 
                 if (result.isSuccess) {
+                    // Tell a streaming client when the page cut the reply short,
+                    // so it can prompt for Continue rather than treat a prefix as
+                    // the whole answer.
+                    val truncated = try { handler.isContinueOffered() } catch (e: Exception) { false }
+                    if (truncated) {
+                        onErrorLogged("/chat: reply was cut off; the page is offering Continue")
+                    }
                     val finalChunkObj = JSONObject().apply {
                         put("id", chunkId)
                         put("object", "chat.completion.chunk")
                         put("created", System.currentTimeMillis() / 1000)
                         put("model", model)
+                        put("x_truncated", truncated)
                         val choiceObj = JSONObject().apply {
                             put("index", 0)
                             put("delta", JSONObject())
-                            put("finish_reason", "stop")
+                            // "length" is the OpenAI signal for a truncated reply.
+                            put("finish_reason", if (truncated) "length" else "stop")
                         }
                         put("choices", JSONArray().put(choiceObj))
                     }
@@ -782,14 +943,12 @@ class LocalHttpServer(
         const val SETTLE_MS = 1_500L
 
         /**
-         * Ceiling for a non-streaming turn.
-         *
-         * The client is waiting on one response, so this has to cover the whole
-         * generation. The Worker allows 180s; staying under that means a slow
-         * answer surfaces as this handler's own error rather than a broken
-         * connection.
+         * How long the stream may stay silent before the request is treated as
+         * stalled. This is a quiet window, not a deadline: any output resets it,
+         * so an answer that takes many minutes but keeps arriving is never cut
+         * off, and a genuinely dead connection fails promptly.
          */
-        const val REQUEST_TIMEOUT_MS = 170_000L
+        const val INACTIVITY_TIMEOUT_MS = 120_000L
     }
 
     /** Reasoning fragments live under a `thinking` path. */

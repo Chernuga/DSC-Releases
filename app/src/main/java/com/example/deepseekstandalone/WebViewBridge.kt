@@ -386,6 +386,59 @@ class WebViewBridge(
         evalJsAwait(script)
     }
 
+    /**
+     * Is the page offering a "Continue" control?
+     *
+     * DeepSeek cuts a long answer off and shows a Continue button. When that
+     * happens the reply the client received is a prefix, and saying so is
+     * better than presenting it as complete.
+     *
+     * Detection is deliberately broad - the label, the aria text and a few
+     * known class hints - because the control's markup has changed across site
+     * versions, and a false negative here silently reports a truncated answer
+     * as finished.
+     */
+    suspend fun isContinueOffered(): Boolean = withContext(Dispatchers.Main) {
+        val script = """
+            (function(){
+              try {
+                var nodes = document.querySelectorAll('button, div[role="button"], [class*="continue"]');
+                for (var i = 0; i < nodes.length; i++) {
+                  var el = nodes[i];
+                  var txt = ((el.innerText || el.textContent || '') + ' ' +
+                             (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+                  if (!txt) continue;
+                  // Only a short label counts; a paragraph mentioning
+                  // "continue" is prose, not the control.
+                  if (txt.length > 40) continue;
+                  if (txt.indexOf('continue') >= 0 || txt.indexOf('resume') >= 0) {
+                    if (el.offsetParent !== null) return true;
+                  }
+                }
+                return false;
+              } catch (e) { return false; }
+            })();
+        """.trimIndent()
+        evalJsAwait(script).trim() == "true"
+    }
+
+    /**
+     * Recover the last assistant reply from the page itself.
+     *
+     * Used when a request failed - a timeout, a dropped stream, a throttled
+     * call - but the page actually produced an answer. Rather than asking the
+     * client to retry (and spend another generation), the text is read straight
+     * out of the transcript and handed back as if it had streamed normally.
+     *
+     * readRenderedAnswer already scopes to the newest assistant message and
+     * uses textContent, so it is not viewport-limited.
+     */
+    suspend fun recoverLastAnswer(): Pair<String, String> = withContext(Dispatchers.Main) {
+        val answer = try { readRenderedAnswer() } catch (e: Exception) { "" }
+        val reasoning = try { readRenderedReasoning() } catch (e: Exception) { "" }
+        answer to reasoning
+    }
+
     /** Release the document-start hook. Call before destroying the WebView. */
     fun dispose() {
         removeDocumentStartHook()
