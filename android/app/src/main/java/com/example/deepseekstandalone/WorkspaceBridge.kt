@@ -107,13 +107,33 @@ class WorkspaceBridge(private val activity: MainActivity) {
     fun restoreFolder(id: String, uriString: String): String {
         return try {
             val uri = Uri.parse(uriString)
-            val doc = DocumentFile.fromTreeUri(activity, uri)
-            if (doc == null || !doc.canRead()) {
-                """{"ok":false,"error":"The folder is no longer accessible."}"""
-            } else {
-                folders[id] = uri
-                """{"ok":true,"id":"$id","name":${jsonString(doc.name ?: "Folder")}}"""
+
+            // Re-assert the persisted grant.
+            //
+            // Android keeps a persistable grant across restarts, but the
+            // process must hold it before DocumentFile can read through the
+            // tree URI. Re-taking is idempotent when the grant already exists,
+            // and it is what makes a restored folder usable rather than merely
+            // remembered.
+            try {
+                activity.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: SecurityException) {
+                // Already held, or the provider does not offer persistable
+                // grants. Not fatal on its own; the canRead check below decides.
             }
+
+            val doc = DocumentFile.fromTreeUri(activity, uri)
+            if (doc == null) {
+                return """{"ok":false,"error":"The folder could not be opened."}"""
+            }
+            if (!doc.canRead()) {
+                return """{"ok":false,"error":"The folder is no longer readable."}"""
+            }
+            folders[id] = uri
+            """{"ok":true,"id":"$id","name":${jsonString(doc.name ?: "Folder")}}"""
         } catch (e: Exception) {
             jsonError("Could not restore the folder: ${e.message}")
         }
