@@ -90,9 +90,14 @@ class MainActivity : ComponentActivity(), ServerHandler {
          * the site's to change.
          */
         const val PREF_LAST_CHAT_URL = "last_deepseek_chat_url"
+        /** How often the page URL is checked for a conversation change. */
+        const val CHAT_URL_POLL_MS = 1_500L
     }
 
     private lateinit var prefs: SharedPreferences
+
+    /** Polls the DeepSeek page URL so pushState navigation is noticed. */
+    private var chatUrlWatcher: Runnable? = null
 
     /** The DeepSeek page. Observable so composition attaches it once created. */
     private var webView by mutableStateOf<WebView?>(null)
@@ -186,23 +191,39 @@ class MainActivity : ComponentActivity(), ServerHandler {
             // page needs no knowledge of this app. It is idempotent: an existing
             // entry with the same id is replaced, and the user's other providers
             // and choices are left untouched.
+            // There is only one WebViewClient per WebView, and WebViewBridge
+            // installs one of its own when it is constructed - which happens
+            // before this runs. Assigning here therefore REPLACED the bridge's
+            // client, silently discarding its URL mirror and its re-injection of
+            // the page helpers on single-page-app navigation.
+            //
+            // This client forwards to the bridge instead of replacing it, so
+            // both responsibilities survive: the bridge keeps tracking the URL,
+            // and this keeps the local provider seeded.
             webViewClient = object : android.webkit.WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
+                    webViewBridge?.onNavigated(url)
                     seedLocalProvider(view ?: return)
-                    rememberChatUrl(url)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    webViewBridge?.onNavigated(url ?: view?.url)
                 }
 
                 // DeepSeek is a single-page app: opening a conversation from the
-                // sidebar changes the URL with pushState, which does not trigger
-                // onPageStarted. This fires for those history updates, so the
-                // remembered conversation follows the user rather than going
-                // stale after the first navigation.
+                // sidebar changes the URL with pushState. Whether this callback
+                // fires for pushState is not guaranteed, which is why the URL is
+                // also polled below; whichever notices first wins.
                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                     super.doUpdateVisitedHistory(view, url, isReload)
+                    webViewBridge?.onHistoryUpdated(url)
                     rememberChatUrl(url)
                 }
             }
+
+            startChatUrlWatcher(view)
 
             // Handle <input type="file">.
             //
@@ -305,6 +326,9 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
     override fun onDestroy() {
         stopBridgeServices()
+        // Stop polling before the WebView is destroyed, otherwise the runnable
+        // reads a torn-down view.
+        stopChatUrlWatcher()
         lifecycleScope.coroutineContext.cancelChildren()
         webViewBridge?.let { runCatching { it.dispose() } }
         webView?.let { view ->
@@ -331,6 +355,39 @@ class MainActivity : ComponentActivity(), ServerHandler {
         // start on the empty home page every time. Falls back to the home page
         // when nothing has been visited yet.
         webViewBridge?.loadUrl(lastChatUrl() ?: DEEPSEEK_URL)
+    }
+
+    /**
+     * Watch the DeepSeek page's real URL and remember the open conversation.
+     *
+     * The site is a single-page app: switching chats calls history.pushState,
+     * which does not reliably reach doUpdateVisitedHistory. Polling the page's
+     * own location is the dependable signal - measured directly, since the
+     * callback fired for full loads but missed the pushState transitions.
+     *
+     * Runs only while a DeepSeek page is loaded, and a repeat of the same URL
+     * costs nothing because rememberChatUrl compares before writing.
+     */
+    private fun startChatUrlWatcher(view: WebView) {
+        if (chatUrlWatcher != null) return
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val runnable = object : Runnable {
+            override fun run() {
+                val url = view.url
+                if (url != null && url.contains("chat.deepseek.com")) {
+                    rememberChatUrl(url)
+                }
+                handler.postDelayed(this, CHAT_URL_POLL_MS)
+            }
+        }
+        chatUrlWatcher = runnable
+        handler.postDelayed(runnable, CHAT_URL_POLL_MS)
+    }
+
+    private fun stopChatUrlWatcher() {
+        val r = chatUrlWatcher ?: return
+        android.os.Handler(android.os.Looper.getMainLooper()).removeCallbacks(r)
+        chatUrlWatcher = null
     }
 
     /** The last DeepSeek conversation URL, if one was visited. */

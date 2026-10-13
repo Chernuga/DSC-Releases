@@ -54,6 +54,24 @@ class WebViewBridge(
         setupWebView()
     }
 
+    /**
+     * Called for every navigation, including single-page-app history changes.
+     *
+     * The activity installs its own WebViewClient (to seed the local provider),
+     * and there is only one per WebView. Rather than each side overwriting the
+     * other's, the activity's client forwards here, so the document-start hook,
+     * the URL mirror and the provider seeding all survive together.
+     */
+    fun onNavigated(url: String?) {
+        currentUrl = url ?: currentUrl
+    }
+
+    /** Re-install the page helpers after a single-page-app navigation. */
+    fun onHistoryUpdated(url: String?) {
+        currentUrl = url ?: currentUrl
+        injectBridgeScript()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         val settings = webView.settings
@@ -105,10 +123,6 @@ class WebViewBridge(
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                 super.doUpdateVisitedHistory(view, url, isReload)
                 currentUrl = url ?: currentUrl
-                // DeepSeek is a SPA: sending a message moves to /a/chat/s/<id>
-                // without a full page load. The document-start hook survives
-                // that (same document), but the helper globals do not, so they
-                // are re-installed here.
                 injectBridgeScript()
             }
         }
