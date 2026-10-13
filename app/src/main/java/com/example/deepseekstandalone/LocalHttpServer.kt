@@ -293,6 +293,16 @@ class LocalHttpServer(
                         val (text, isReasoning) = extractDelta(chunk)
                         if (text.isEmpty()) return@sendPrompt
                         if (isReasoning) reasoning.append(text) else answer.append(text)
+                        // Also record it in the bridge.
+                        //
+                        // The streaming handler did this and this one did not, so
+                        // a reply fetched through /full left the bridge's raw
+                        // accumulator empty. recoverLastAnswer then fell through
+                        // to the DOM fallback and returned rendered text - with
+                        // the code fences replaced by the copy/download buttons
+                        // and the file-command markers stripped, so a recovered
+                        // reply could not drive file edits.
+                        handler.noteStreamedText(text, isReasoning)
                         lastProgressAt.set(System.currentTimeMillis())
                     }
                 }

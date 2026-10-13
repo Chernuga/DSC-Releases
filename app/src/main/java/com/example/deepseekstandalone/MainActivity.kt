@@ -80,6 +80,15 @@ class MainActivity : ComponentActivity(), ServerHandler {
         const val DEEPSEEK_URL = "https://chat.deepseek.com"
         /** The published client UI. */
         const val WEB_UI_URL = "https://chernuga.github.io/ZhiPu-Integration/"
+        /**
+         * Remembers the last DeepSeek conversation so the app reopens it.
+         *
+         * The site puts the chat's id in the path
+         * (chat.deepseek.com/a/chat/s/<uuid>), so the full URL is stored and
+         * restored verbatim rather than rebuilt from an id - the path shape is
+         * the site's to change.
+         */
+        const val PREF_LAST_CHAT_URL = "last_deepseek_chat_url"
     }
 
     private lateinit var prefs: SharedPreferences
@@ -180,6 +189,17 @@ class MainActivity : ComponentActivity(), ServerHandler {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     seedLocalProvider(view ?: return)
+                    rememberChatUrl(url)
+                }
+
+                // DeepSeek is a single-page app: opening a conversation from the
+                // sidebar changes the URL with pushState, which does not trigger
+                // onPageStarted. This fires for those history updates, so the
+                // remembered conversation follows the user rather than going
+                // stale after the first navigation.
+                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    rememberChatUrl(url)
                 }
             }
 
@@ -306,7 +326,35 @@ class MainActivity : ComponentActivity(), ServerHandler {
     private fun loadDeepSeekOnce() {
         if (initialLoadStarted) return
         initialLoadStarted = true
-        webViewBridge?.loadUrl(DEEPSEEK_URL)
+        // Reopen the conversation that was last on screen, so the app does not
+        // start on the empty home page every time. Falls back to the home page
+        // when nothing has been visited yet.
+        webViewBridge?.loadUrl(lastChatUrl() ?: DEEPSEEK_URL)
+    }
+
+    /** The last DeepSeek conversation URL, if one was visited. */
+    private fun lastChatUrl(): String? {
+        val saved = prefs.getString(PREF_LAST_CHAT_URL, null) ?: return null
+        // Only ever replay a real conversation on the expected host; a stale or
+        // edited value must not be able to point the app somewhere else.
+        return if (saved.startsWith("https://chat.deepseek.com/a/chat/s/")) saved else null
+    }
+
+    /**
+     * Remember the conversation currently open.
+     *
+     * Called on page navigation. Only a conversation URL is stored: the home
+     * page would otherwise overwrite a good value, and the app would forget
+     * where it was as soon as the user tapped back.
+     */
+    private fun rememberChatUrl(url: String?) {
+        val u = url.orEmpty()
+        if (!u.startsWith("https://chat.deepseek.com/a/chat/s/")) return
+        // Ignore trailing query/fragment noise so the same chat matches itself.
+        val clean = u.substringBefore('?').substringBefore('#')
+        if (prefs.getString(PREF_LAST_CHAT_URL, null) != clean) {
+            prefs.edit().putString(PREF_LAST_CHAT_URL, clean).apply()
+        }
     }
 
     /**
@@ -568,7 +616,16 @@ fun StandaloneScreen(
     domPrompt: String? = null,
     onDomPromptAnswer: (Boolean) -> Unit = {}
 ) {
-    val pagerState = rememberPagerState(pageCount = { PAGE_TITLES.size })
+    // Open on "Web UI", not on the DeepSeek page.
+    //
+    // The DeepSeek page is the engine - it holds the session and does the
+    // generating - but it is not what the user works in. Starting there meant
+    // swiping past it on every launch. It stays one tap to the left, because it
+    // is still needed to press Continue when a reply is cut off.
+    val pagerState = rememberPagerState(
+        initialPage = 1,
+        pageCount = { PAGE_TITLES.size }
+    )
     val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     // The native hosts are remembered so they outlive recomposition.
