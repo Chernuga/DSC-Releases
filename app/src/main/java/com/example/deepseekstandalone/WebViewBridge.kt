@@ -451,50 +451,6 @@ class WebViewBridge(
         answer to reasoning
     }
 
-    /**
-     * TEMPORARY: report how the page exposes an assistant message's text.
-     *
-     * The site's copy button copies the original markdown, not the rendered
-     * text, and fetch-last must return the same thing. This looks for a raw
-     * source on the DOM so the bridge can read it rather than reconstruct it.
-     */
-    suspend fun probeRawSources(): String = withContext(Dispatchers.Main) {
-        val script = """
-            (function(){
-              try {
-                var out = { url: location.href, msgs: [] };
-                var msgs = document.querySelectorAll('[class*="ds-message"]');
-                for (var i = Math.max(0, msgs.length - 2); i < msgs.length; i++) {
-                  var m = msgs[i];
-                  var info = { cls: (m.className || '').slice(0, 60), dataset: {}, react: [], kids: [] };
-                  // Any data-* attribute could hold the source.
-                  for (var d in m.dataset) info.dataset[d] = String(m.dataset[d]).slice(0, 80);
-                  for (var k in m) if (k.indexOf('__react') === 0) info.react.push(k);
-                  // Look at descendants for a markdown-ish container.
-                  var body = m.querySelector('[class*="ds-assistant-message-main-content"], [class*="ds-markdown"]');
-                  if (body) {
-                    info.bodyCls = (body.className || '').slice(0, 80);
-                    info.bodyDataset = {};
-                    for (var d2 in body.dataset) info.bodyDataset[d2] = String(body.dataset[d2]).slice(0, 120);
-                    info.textSample = (body.textContent || '').slice(0, 120);
-                    // Does it contain the file-command syntax that the copy
-                    // button would include but rendering strips?
-                    info.hasCmdMarkers = /```|\bcreate:|\bfind:|\breplace:/.test(body.textContent || '');
-                  }
-                  out.msgs.push(info);
-                }
-                // Is there a React root carrying message state?
-                var root = document.querySelector('#root, [id*="root"]');
-                if (root) {
-                  for (var k2 in root) if (k2.indexOf('__react') === 0) out.rootReact = k2;
-                }
-                return JSON.stringify(out);
-              } catch (e) { return 'probe error: ' + e; }
-            })();
-        """.trimIndent()
-        evalJsAwait(script)
-    }
-
     /** Release the document-start hook. Call before destroying the WebView. */
     fun dispose() {
         removeDocumentStartHook()

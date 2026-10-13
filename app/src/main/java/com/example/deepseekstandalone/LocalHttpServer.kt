@@ -71,8 +71,6 @@ interface ServerHandler {
     suspend fun isContinueOffered(): Boolean = false
     /** The newest assistant reply already present on the page, or "" if none. */
     suspend fun recoverLastAnswer(): Pair<String, String> = "" to ""
-    /** TEMPORARY diagnostic: how the page exposes raw message text. */
-    suspend fun probeRawSources(): String = "{}"
     /** Record parsed text so the finished answer can be rebuilt from the wire. */
     fun noteStreamedText(text: String, isReasoning: Boolean) {}
     /**
@@ -143,11 +141,6 @@ class LocalHttpServer(
             // Stop the in-flight generation in the page.
             uri == "/stop" && (method == Method.POST || method == Method.GET) -> handleStop()
             uri == "/errors" && method == Method.GET -> handleErrors()
-            // TEMPORARY: what raw text the page exposes, for fetch-last.
-            uri == "/debug/raw" && method == Method.GET -> jsonResponse(
-                Response.Status.OK,
-                runBlocking { handler.probeRawSources() }
-            )
             else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "Not found"))
         }
     }
