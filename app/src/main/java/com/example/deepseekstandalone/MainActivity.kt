@@ -505,6 +505,7 @@ class MainActivity : ComponentActivity(), ServerHandler {
     override suspend fun isContinueOffered(): Boolean = webViewBridge?.isContinueOffered() ?: false
     override suspend fun recoverLastAnswer(): Pair<String, String> =
         webViewBridge?.recoverLastAnswer() ?: ("" to "")
+    override suspend fun probeRawSources(): String = webViewBridge?.probeRawSources() ?: "{}"
     override fun noteStreamedText(text: String, isReasoning: Boolean) {
         webViewBridge?.noteStreamedText(text, isReasoning)
     }

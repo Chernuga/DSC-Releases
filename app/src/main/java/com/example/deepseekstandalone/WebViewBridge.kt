@@ -423,20 +423,76 @@ class WebViewBridge(
     }
 
     /**
-     * Recover the last assistant reply from the page itself.
+     * Recover the last assistant reply, as raw text.
      *
-     * Used when a request failed - a timeout, a dropped stream, a throttled
-     * call - but the page actually produced an answer. Rather than asking the
-     * client to retry (and spend another generation), the text is read straight
-     * out of the transcript and handed back as if it had streamed normally.
+     * The stream hook already accumulates the exact characters the page
+     * received, which is the same thing the site's copy button produces -
+     * including any file-command markers, which the rendered DOM does NOT have
+     * (verified: the rendered blocks carry no ``` or create:/find:/replace:
+     * markers, and React's fibre is not safely walkable from injected script).
      *
-     * readRenderedAnswer already scopes to the newest assistant message and
-     * uses textContent, so it is not viewport-limited.
+     * Scraping the DOM was therefore wrong for this purpose: it returned the
+     * rendered text with the commands stripped, so a recovered reply could not
+     * drive file edits. The captured stream is tried first and the DOM is only a
+     * fallback for when the hook saw nothing (for example a reply that arrived
+     * before the app started watching).
      */
     suspend fun recoverLastAnswer(): Pair<String, String> = withContext(Dispatchers.Main) {
+        val rawAnswer = streamedAnswerText()
+        val rawReasoning = streamedReasoningText()
+
+        if (rawAnswer.isNotBlank()) {
+            return@withContext rawAnswer to rawReasoning
+        }
+
+        // Nothing captured this session: fall back to reading the page.
         val answer = try { readRenderedAnswer() } catch (e: Exception) { "" }
         val reasoning = try { readRenderedReasoning() } catch (e: Exception) { "" }
         answer to reasoning
+    }
+
+    /**
+     * TEMPORARY: report how the page exposes an assistant message's text.
+     *
+     * The site's copy button copies the original markdown, not the rendered
+     * text, and fetch-last must return the same thing. This looks for a raw
+     * source on the DOM so the bridge can read it rather than reconstruct it.
+     */
+    suspend fun probeRawSources(): String = withContext(Dispatchers.Main) {
+        val script = """
+            (function(){
+              try {
+                var out = { url: location.href, msgs: [] };
+                var msgs = document.querySelectorAll('[class*="ds-message"]');
+                for (var i = Math.max(0, msgs.length - 2); i < msgs.length; i++) {
+                  var m = msgs[i];
+                  var info = { cls: (m.className || '').slice(0, 60), dataset: {}, react: [], kids: [] };
+                  // Any data-* attribute could hold the source.
+                  for (var d in m.dataset) info.dataset[d] = String(m.dataset[d]).slice(0, 80);
+                  for (var k in m) if (k.indexOf('__react') === 0) info.react.push(k);
+                  // Look at descendants for a markdown-ish container.
+                  var body = m.querySelector('[class*="ds-assistant-message-main-content"], [class*="ds-markdown"]');
+                  if (body) {
+                    info.bodyCls = (body.className || '').slice(0, 80);
+                    info.bodyDataset = {};
+                    for (var d2 in body.dataset) info.bodyDataset[d2] = String(body.dataset[d2]).slice(0, 120);
+                    info.textSample = (body.textContent || '').slice(0, 120);
+                    // Does it contain the file-command syntax that the copy
+                    // button would include but rendering strips?
+                    info.hasCmdMarkers = /```|\bcreate:|\bfind:|\breplace:/.test(body.textContent || '');
+                  }
+                  out.msgs.push(info);
+                }
+                // Is there a React root carrying message state?
+                var root = document.querySelector('#root, [id*="root"]');
+                if (root) {
+                  for (var k2 in root) if (k2.indexOf('__react') === 0) out.rootReact = k2;
+                }
+                return JSON.stringify(out);
+              } catch (e) { return 'probe error: ' + e; }
+            })();
+        """.trimIndent()
+        evalJsAwait(script)
     }
 
     /** Release the document-start hook. Call before destroying the WebView. */

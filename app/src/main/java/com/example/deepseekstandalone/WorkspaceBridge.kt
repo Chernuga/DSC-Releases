@@ -217,6 +217,56 @@ class WorkspaceBridge(private val activity: MainActivity) {
         }
     }
 
+    /**
+     * Open a workspace file in whatever app handles it.
+     *
+     * The page cannot launch an intent, so a file the user wants to view - an
+     * HTML page in particular - is handed here. When a folder is linked the file
+     * is opened straight from disk, so relative links and sibling assets resolve
+     * correctly; otherwise the content is written to the app's cache and opened
+     * from there.
+     *
+     * `contentBase64` is the workspace copy, used only when there is no linked
+     * folder to read from.
+     */
+    @JavascriptInterface
+    fun openFile(
+        id: String?,
+        relativePath: String,
+        mimeType: String,
+        contentBase64: String
+    ): String {
+        return try {
+            val uri: Uri = if (id != null && folders.containsKey(id)) {
+                val tree = folders[id]!!
+                findFile(tree, relativePath)?.uri
+                    ?: return jsonError("No such file in the linked folder: $relativePath")
+            } else {
+                // No linked folder: materialise it in the cache so the viewer
+                // has something to read.
+                val name = relativePath.substringAfterLast('/')
+                val dir = java.io.File(activity.cacheDir, "preview").apply { mkdirs() }
+                val out = java.io.File(dir, name)
+                out.writeBytes(Base64.decode(contentBase64, Base64.DEFAULT))
+                androidx.core.content.FileProvider.getUriForFile(
+                    activity,
+                    activity.packageName + ".fileprovider",
+                    out
+                )
+            }
+
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType.ifBlank { "*/*" })
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            activity.startActivity(intent)
+            """{"ok":true}"""
+        } catch (e: Exception) {
+            jsonError("Could not open $relativePath: ${e.message}")
+        }
+    }
+
     /** Called by the activity when the picker returns. */
     fun onFolderPicked(uri: Uri?, cancelled: Boolean) {
         pickerResult = uri
