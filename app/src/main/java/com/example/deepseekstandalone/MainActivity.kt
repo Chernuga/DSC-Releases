@@ -75,6 +75,8 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
     companion object {
         const val NOTIFICATION_PERMISSION_REQUEST = 9001
+        /** Result code for a file chooser opened from a page's <input type=file>. */
+        const val FILE_CHOOSER_REQUEST = 7002
         const val DEEPSEEK_URL = "https://chat.deepseek.com"
         /** The published client UI. */
         const val WEB_UI_URL = "https://chernuga.github.io/ZhiPu-Integration/"
@@ -94,6 +96,23 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
 
     private var localHttpServer: LocalHttpServer? = null
+
+    /**
+     * SAF bridge for the web UI's linked-folder workspace.
+     *
+     * Created eagerly so it exists before any page loads; the interface is
+     * registered on the client WebView and called from its JavaScript.
+     */
+    internal val workspaceBridge by lazy { WorkspaceBridge(this) }
+
+    /**
+     * Pending result for a file chooser opened from a page.
+     *
+     * A WebView cannot open the system picker itself, so [WebChromeClient] hands
+     * the request here and the activity launches it. One at a time: a second
+     * chooser cannot open while the first is still up.
+     */
+    private var fileChooserCallback: android.webkit.ValueCallback<Uri?>? = null
 
     // Observable Compose state
     private var isApiEnabledState by mutableStateOf(false)
@@ -145,6 +164,10 @@ class MainActivity : ComponentActivity(), ServerHandler {
             // the page never renders an unconfigured state first.
             addJavascriptInterface(ProviderSeeder(), "AndroidLocalProvider")
 
+            // Lets the page link a real device folder as a conversation
+            // workspace, and read and write files inside it.
+            addJavascriptInterface(workspaceBridge, "AndroidWorkspace")
+
             // Merge the local provider into the page's stored settings before
             // its own script runs.
             //
@@ -157,6 +180,35 @@ class MainActivity : ComponentActivity(), ServerHandler {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     seedLocalProvider(view ?: return)
+                }
+            }
+
+            // Handle <input type="file">.
+            //
+            // Without this the page can render a file picker but tapping it does
+            // nothing: a WebView cannot open the system chooser on its own, so
+            // the request must be launched by the activity.
+            webChromeClient = object : android.webkit.WebChromeClient() {
+                override fun onShowFileChooser(
+                    view: WebView?,
+                    callback: android.webkit.ValueCallback<Array<Uri>?>?,
+                    params: FileChooserParams?
+                ): Boolean {
+                    if (fileChooserCallback != null) return false // one at a time
+                    // Wrap the single-URI result in the array the API expects.
+                    fileChooserCallback = object : android.webkit.ValueCallback<Uri?> {
+                        override fun onReceiveValue(value: Uri?) {
+                            callback?.onReceiveValue(if (value != null) arrayOf(value) else null)
+                        }
+                    }
+                    return try {
+                        startActivityForResult(params!!.createIntent(), FILE_CHOOSER_REQUEST)
+                        true
+                    } catch (e: Exception) {
+                        fileChooserCallback = null
+                        logError("Could not open the file chooser: ${e.message}")
+                        false
+                    }
                 }
             }
 
@@ -189,7 +241,8 @@ class MainActivity : ComponentActivity(), ServerHandler {
                             errorLogList.clear()
                             lastErrorState = null
                         },
-                        onRefreshStats = { refreshStats(); probeUiPage() },
+                        onRefreshStats = { refreshStats(); probeUiPage(); probePageVersion() },
+                        onTestSend = { sendFromUiPage("Say exactly: PAGETEST") },
                         onReloadUiWebView = { uiWebView?.reload() },
                         uiWebView = uiWebView,
                         domPrompt = domPromptState,
@@ -200,6 +253,33 @@ class MainActivity : ComponentActivity(), ServerHandler {
         }
 
         loadDeepSeekOnce()
+    }
+
+    /**
+     * Results from the folder picker and the file chooser.
+     *
+     * The folder picker is started by WorkspaceBridge (the page cannot open one
+     * itself); its result is handed straight back to the waiting call.
+     */
+    @Deprecated("startActivityForResult is still the simplest route for ACTION_OPEN_DOCUMENT_TREE")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == WorkspaceBridge.PICK_FOLDER_REQUEST) {
+            val uri = data?.data
+            val ok = resultCode == RESULT_OK && uri != null
+            workspaceBridge.onFolderPicked(if (ok) uri else null, cancelled = !ok)
+            if (ok) logError("Workspace folder linked: ${uri}")
+            else logError("Workspace folder selection cancelled")
+            return
+        }
+
+        // A file chooser opened from the page (an <input type=file>).
+        fileChooserCallback?.let { cb ->
+            fileChooserCallback = null
+            if (resultCode == RESULT_OK && data != null) cb.onReceiveValue(data.data)
+            else cb.onReceiveValue(null)
+        }
     }
 
     override fun onDestroy() {
@@ -295,6 +375,55 @@ class MainActivity : ComponentActivity(), ServerHandler {
         """.trimIndent()
         v.evaluateJavascript(js) { r -> logError("WebUI probe: $r") }
     }
+    /**
+     * Report which build of the hosted page the WebView is running.
+     *
+     * A stale cached copy is invisible otherwise: the page works, just with old
+     * behaviour, so the only way to tell is to ask it.
+     */
+    private fun probePageVersion() {
+        val v = uiWebView ?: return
+        val js = """
+            (function(){
+              try {
+                var html = document.documentElement.outerHTML;
+                return JSON.stringify({
+                  hasMergedFix: html.indexOf('Merge the prompt finish into the final user turn') >= 0,
+                  hasOldLeadingFold: html.indexOf('folded into the LEADING system message') >= 0,
+                  hasTrailingFinish: html.indexOf('settings.promptFinish.trim() });') >= 0,
+                  scriptLen: html.length
+                });
+              } catch (e) { return 'err: ' + e; }
+            })();
+        """.trimIndent()
+        v.evaluateJavascript(js) { r -> logError("PageVersion: $r") }
+    }
+    /**
+     * Send a message through the hosted page's own send path.
+     *
+     * Synthetic taps on the composer are unreliable once the soft keyboard
+     * opens, so this drives the page's own entry point instead: the same code a
+     * real click runs, including how it builds the request.
+     */
+    private fun sendFromUiPage(text: String) {
+        val v = uiWebView ?: return
+        val safe = text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+        val js = """
+            (function(){
+              try {
+                var ta = document.getElementById('input');
+                if (!ta) return 'no-input';
+                ta.value = "$safe";
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                if (typeof send !== 'function') return 'no-send-fn';
+                send();
+                return 'sent';
+              } catch (e) { return 'error: ' + e; }
+            })();
+        """.trimIndent()
+        v.evaluateJavascript(js) { r -> logError("UiPageSend: $r") }
+    }
+
     // -- server -----------------------------------------------------------------
 
     private fun startBridgeServices() {
@@ -432,6 +561,7 @@ fun StandaloneScreen(
     onRefreshStats: () -> Unit,
     uiWebView: WebView?,
     onReloadUiWebView: () -> Unit,
+    onTestSend: () -> Unit,
     domPrompt: String? = null,
     onDomPromptAnswer: (Boolean) -> Unit = {}
 ) {
@@ -548,7 +678,8 @@ fun StandaloneScreen(
                     onReloadPage = onReloadWebView,
                     onReloadUi = onReloadUiWebView,
                     onClearErrors = onClearErrors,
-                    onRefreshStats = onRefreshStats
+                    onRefreshStats = onRefreshStats,
+                    onTestSend = onTestSend
                 )
             }
         }
@@ -591,7 +722,8 @@ private fun ControlsPage(
     onReloadPage: () -> Unit,
     onReloadUi: () -> Unit,
     onClearErrors: () -> Unit,
-    onRefreshStats: () -> Unit
+    onRefreshStats: () -> Unit,
+    onTestSend: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -631,6 +763,7 @@ private fun ControlsPage(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(onClick = onReloadPage) { Text("Reload DeepSeek") }
             OutlinedButton(onClick = onRefreshStats) { Text("Refresh") }
+            OutlinedButton(onClick = onTestSend) { Text("Test send") }
         }
 
         Row(

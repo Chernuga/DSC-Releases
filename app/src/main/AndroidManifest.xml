@@ -4,10 +4,28 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+        File access.
+
+        The web UI can attach files to a prompt, and the Link Folder feature
+        writes the conversation's workspace into a folder the user picks. Both
+        go through the Storage Access Framework, which grants access to exactly
+        the chosen location and needs no broad storage permission.
+
+        READ_MEDIA_* is declared for Android 13+ so the picker can offer images
+        and documents without falling back to a legacy prompt; maxSdkVersion on
+        READ_EXTERNAL_STORAGE covers older releases only.
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
     <!--
         Without a foreground service the process is frozen when the screen
-        locks, which stops the WebView, the local server and the tunnel. The
-        bridge is only useful while it keeps running in the background.
+        locks, which stops the WebView and the local server. The bridge is only
+        useful while it keeps running.
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />

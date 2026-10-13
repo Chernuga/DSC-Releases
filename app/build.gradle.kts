@@ -47,6 +47,8 @@ dependencies {
     // addDocumentStartJavaScript with a graceful fallback below API 28, so the
     // stream hook is installed before the page's own scripts run.
     implementation(libs.androidx.webkit)
+    // Reads and writes the linked workspace folder through SAF.
+    implementation(libs.androidx.documentfile)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
