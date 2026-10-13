@@ -55,6 +55,7 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 
 /**
  * Standalone build: the DeepSeek page, the control UI and the web client all
@@ -576,42 +577,57 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
         // 2. Find the control, hovering the turn to reveal it.
         val located = try {
-            org.json.JSONObject(bridge.locateMessageCopyButton())
+            bridge.locateMessageCopyButton()
         } catch (e: Exception) {
             logError("copy: could not locate the control: ${e.message}")
-            return ""
+            null
         }
-        if (!located.optBoolean("ok")) {
-            logError("copy: ${located.optString("error", "copy control not found")}")
+        if (located == null || !located.optBoolean("ok")) {
+            logError("copy: ${located?.optString("error") ?: "copy control not found"}")
             return ""
         }
 
-        // 3. Tap it with a real touch. Coordinates come from the page and the
-        //    WebView is full-bleed inside the activity, but the status bar
-        //    offset is applied so the tap lands where the page drew the button.
+        // 3. Tap it with a real touch.
+        //
+        // Coordinates are view-local, not screen coordinates: dispatchTouchEvent
+        // expects them relative to the view's own top-left, and adding the
+        // on-screen offset here (as an earlier attempt did) double-counted the
+        // status and tab bars so the tap landed well below the button.
         val x = located.optInt("x")
         val y = located.optInt("y")
         return try {
             val view = webView ?: return ""
-            val offset = IntArray(2)
-            view.getLocationOnScreen(offset)
-            val scale = view.resources.displayMetrics.density
-            // The page reports CSS pixels; the gesture API wants device pixels.
-            val downTime = android.os.SystemClock.uptimeMillis()
-            val px = offset[0] + x * scale
-            val py = offset[1] + y * scale
 
+            // The page reports CSS pixels; MotionEvent wants device pixels.
+            val scale = view.resources.displayMetrics.density
+            val px = x * scale
+            val py = y * scale
+
+            val downTime = android.os.SystemClock.uptimeMillis()
+
+            // A real tap needs a plausible move between down and up, otherwise
+            // the WebView can treat it as a stray event and ignore the click.
             val down = android.view.MotionEvent.obtain(
                 downTime, downTime,
                 android.view.MotionEvent.ACTION_DOWN, px, py, 0
             )
+            val move = android.view.MotionEvent.obtain(
+                downTime, downTime + 40,
+                android.view.MotionEvent.ACTION_MOVE, px, py, 0
+            )
             val up = android.view.MotionEvent.obtain(
-                downTime, downTime + 60,
+                downTime, downTime + 70,
                 android.view.MotionEvent.ACTION_UP, px, py, 0
             )
+            down.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN)
+            move.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN)
+            up.setSource(android.view.InputDevice.SOURCE_TOUCHSCREEN)
+
             view.dispatchTouchEvent(down)
+            view.dispatchTouchEvent(move)
             view.dispatchTouchEvent(up)
             down.recycle()
+            move.recycle()
             up.recycle()
 
             kotlinx.coroutines.delay(600)
@@ -809,14 +825,34 @@ fun StandaloneScreen(
             )
 
             // Compose draws in order, so the host for the active page must be
-            // the one on top; the other is hidden outright.
+            // the one on top; the other is kept INVISIBLE rather than GONE.
+            //
+            // GONE removes a view from layout, so the hidden WebView was laid
+            // out at zero size and its page reported innerWidth/innerHeight of
+            // 0. DeepSeek renders its transcript in a virtualised list, which
+            // produces no rows at all in a zero-height viewport - measured
+            // directly, and the reason every attempt to read or copy the
+            // transcript from the hidden tab found nothing. INVISIBLE keeps the
+            // view laid out at full size while not drawing it, so the page stays
+            // renderable and its messages are present for the copy routine
+            // without the user seeing anything.
+            //
+            // The active host is raised above the other so the two never fight
+            // over the same pixels.
             androidx.compose.runtime.SideEffect {
+                val showDeepSeek = pagerState.currentPage == 0
                 deepseekHost.value?.visibility =
-                    if (pagerState.currentPage == 0) android.view.View.VISIBLE
-                    else android.view.View.GONE
+                    if (showDeepSeek) android.view.View.VISIBLE else android.view.View.INVISIBLE
                 uiHost.value?.visibility =
-                    if (pagerState.currentPage == 1) android.view.View.VISIBLE
-                    else android.view.View.GONE
+                    if (pagerState.currentPage == 1) android.view.View.VISIBLE else android.view.View.INVISIBLE
+
+                // Keep the visible page on top; both are laid out, only one is
+                // drawn.
+                if (showDeepSeek) {
+                    deepseekHost.value?.bringToFront()
+                } else {
+                    uiHost.value?.bringToFront()
+                }
             }
 
             if (pagerState.currentPage == 2) {

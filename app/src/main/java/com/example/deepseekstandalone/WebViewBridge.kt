@@ -18,6 +18,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import org.json.JSONTokener
 import java.util.concurrent.ConcurrentHashMap
 
 class WebViewBridge(
@@ -468,13 +470,10 @@ class WebViewBridge(
     /**
      * Locate the copy control for the newest assistant reply, in page pixels.
      *
-     * Returns JSON with x/y for a real touch, or an error explaining why the
-     * control could not be found. The button is hover-gated: the site reveals it
-     * only when the message is hovered, and a programmatic click on a hidden
-     * element does nothing (verified - seven buttons were clicked with the
-     * clipboard hooked and nothing was written).
+     * Returns the parsed result: {ok, x, y} or {ok:false, error}. See
+     * evalJsObject for why the transport quoting is stripped.
      */
-    suspend fun locateMessageCopyButton(): String = withContext(Dispatchers.Main) {
+    suspend fun locateMessageCopyButton(): JSONObject? = withContext(Dispatchers.Main) {
         val script = """
             (function(){
               try {
@@ -483,57 +482,72 @@ class WebViewBridge(
                   return p ? (p.getAttribute('d') || '') : '';
                 }
 
-                // Reveal hover-only controls by dispatching real mouse events
-                // over each assistant turn, newest first.
-                var turns = document.querySelectorAll('[class*="ds-message"], [class*="message"]');
-                if (!turns.length) return JSON.stringify({ ok: false, error: 'no message nodes in the DOM' });
+                // Rows live in .ds-virtual-list-visible-items; there are no
+                // ds-message elements on the page at all (measured on the live
+                // site - assuming that class is why the first attempt reported
+                // "no message nodes in the DOM").
+                var rows = document.querySelectorAll('.ds-virtual-list-visible-items > *');
+                if (!rows.length) rows = document.querySelectorAll('.ds-virtual-list-items > *');
+                if (!rows.length) {
+                  return JSON.stringify({ ok: false, error: 'no message rows rendered' });
+                }
 
                 function hover(el) {
                   var r = el.getBoundingClientRect();
-                  var opts = { bubbles: true, cancelable: true, view: window,
-                               clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
-                  el.dispatchEvent(new MouseEvent('mouseover', opts));
-                  el.dispatchEvent(new MouseEvent('mouseenter', opts));
-                  el.dispatchEvent(new MouseEvent('mousemove', opts));
+                  var o = { bubbles: true, cancelable: true, view: window,
+                            clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+                  el.dispatchEvent(new MouseEvent('mouseover', o));
+                  el.dispatchEvent(new MouseEvent('mouseenter', o));
+                  el.dispatchEvent(new MouseEvent('mousemove', o));
                 }
 
-                for (var i = turns.length - 1; i >= 0; i--) {
-                  var t = turns[i];
-                  // The assistant turn is the one carrying rendered markdown or a
-                  // thinking block; the user turn has neither.
-                  if (!t.querySelector('[class*="markdown"], [class*="think"]')) continue;
-                  hover(t);
+                // The copy glyph, measured by clicking every button on the page
+                // with the clipboard hooked. Buttons carrying it are: the
+                // per-thinking-block copies, the per-code-block copies, and -
+                // last in the assistant row - the whole-message copy. Only the
+                // last one yields the message, which is what is wanted.
+                var COPY_GLYPH = 'M6.14929 4.02032';
 
-                  var btns = t.querySelectorAll('.ds-button, [class*="button"]');
+                // Walk EVERY row and keep the LAST matching button overall, not
+                // the last row that merely contains a thinking block. The rows
+                // interleave user messages with assistant turns, and the
+                // assistant turn contains many thinking-fragment controls, so
+                // "last row with a think block" selected an assistant sub-block
+                // and copied a fragment of the previous reply.
+                var best = null;
+                for (var i = 0; i < rows.length; i++) {
+                  var btns = rows[i].querySelectorAll('.ds-button');
                   for (var j = 0; j < btns.length; j++) {
                     var b = btns[j];
                     var aria = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '');
-                    var d = svgPath(b);
-                    // The copy glyph is two overlapping rounded rectangles.
-                    var isCopyGlyph = d.indexOf('9.67272') >= 0 || d.indexOf('M11.748 6.7028') >= 0;
                     var named = /copy/i.test(aria);
-                    if (!named && !isCopyGlyph) continue;
+                    var isGlyph = svgPath(b).indexOf(COPY_GLYPH) === 0;
+                    if (!named && !isGlyph) continue;
                     if (!b.offsetParent) continue;
-
                     var r = b.getBoundingClientRect();
                     if (r.width < 1 || r.height < 1) continue;
-                    return JSON.stringify({
-                      ok: true,
+                    // Later matches overwrite earlier ones, so the final
+                    // assignment is the message-level control.
+                    best = {
                       x: Math.round(r.left + r.width / 2),
                       y: Math.round(r.top + r.height / 2),
                       named: named,
-                      width: Math.round(r.width),
-                      height: Math.round(r.height)
-                    });
+                      row: i,
+                      btn: j
+                    };
                   }
                 }
-                return JSON.stringify({ ok: false, error: 'no copy control found on an assistant turn' });
+                if (!best) {
+                  return JSON.stringify({ ok: false, error: 'no copy control found' });
+                }
+                best.ok = true;
+                return JSON.stringify(best);
               } catch (e) {
                 return JSON.stringify({ ok: false, error: String(e) });
               }
             })();
         """.trimIndent()
-        evalJsAwait(script)
+        evalJsObject(script)
     }
 
     /**
@@ -970,6 +984,35 @@ class WebViewBridge(
                 if (cont.isActive) cont.resume(value ?: "null") { _, _, _ -> }
             }
         }
+
+    /**
+     * Evaluate a script that returns a JSON *string* and parse it.
+     *
+     * WebView.evaluateJavascript JSON-encodes whatever the script returns, so a
+     * script ending in JSON.stringify(...) hands back a quoted string, not an
+     * object. Passing that straight to JSONObject throws
+     * "Value \"...\" of type java.lang.String cannot be converted to JSONObject",
+     * which is exactly how the first copy attempt failed. The outer layer is
+     * removed here so callers get the object they asked for.
+     *
+     * Returns null when the script failed, returned null, or produced something
+     * that is not a JSON object.
+     */
+    suspend fun evalJsObject(script: String): JSONObject? = withContext(Dispatchers.Main) {
+        val raw = evalJsAwait(script)
+        if (raw.isBlank() || raw == "null") return@withContext null
+        val text = try {
+            // Unwrap the transport quoting.
+            if (raw.startsWith("\"")) JSONTokener(raw).nextValue() as? String ?: raw else raw
+        } catch (e: Exception) {
+            raw
+        }
+        try {
+            JSONObject(text)
+        } catch (e: Exception) {
+            null
+        }
+    }
 
 
     /**
