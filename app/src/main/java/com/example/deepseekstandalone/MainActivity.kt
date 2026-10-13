@@ -553,6 +553,98 @@ class MainActivity : ComponentActivity(), ServerHandler {
     override suspend fun isContinueOffered(): Boolean = webViewBridge?.isContinueOffered() ?: false
     override suspend fun recoverLastAnswer(): Pair<String, String> =
         webViewBridge?.recoverLastAnswer() ?: ("" to "")
+
+    /**
+     * Drive the page's own copy control and return what it produced.
+     *
+     * A real touch is required: the site reveals the control on hover and a
+     * programmatic click on the hidden element does nothing - seven were clicked
+     * with the clipboard hooked and nothing was written. So the sequence is
+     * scroll to the bottom (the transcript is virtualised, so an off-screen
+     * message is not in the DOM at all), ask the page where the control is, tap
+     * it with a genuine gesture, then read the clipboard.
+     */
+    override suspend fun copyLastReplyViaButton(): String {
+        val bridge = webViewBridge ?: return ""
+
+        // 1. Bring the newest reply into view; without this it may not be
+        //    rendered at all.
+        try {
+            bridge.scrollTranscriptToBottom()
+            kotlinx.coroutines.delay(400)
+        } catch (e: Exception) { /* scrolling is best effort */ }
+
+        // 2. Find the control, hovering the turn to reveal it.
+        val located = try {
+            org.json.JSONObject(bridge.locateMessageCopyButton())
+        } catch (e: Exception) {
+            logError("copy: could not locate the control: ${e.message}")
+            return ""
+        }
+        if (!located.optBoolean("ok")) {
+            logError("copy: ${located.optString("error", "copy control not found")}")
+            return ""
+        }
+
+        // 3. Tap it with a real touch. Coordinates come from the page and the
+        //    WebView is full-bleed inside the activity, but the status bar
+        //    offset is applied so the tap lands where the page drew the button.
+        val x = located.optInt("x")
+        val y = located.optInt("y")
+        return try {
+            val view = webView ?: return ""
+            val offset = IntArray(2)
+            view.getLocationOnScreen(offset)
+            val scale = view.resources.displayMetrics.density
+            // The page reports CSS pixels; the gesture API wants device pixels.
+            val downTime = android.os.SystemClock.uptimeMillis()
+            val px = offset[0] + x * scale
+            val py = offset[1] + y * scale
+
+            val down = android.view.MotionEvent.obtain(
+                downTime, downTime,
+                android.view.MotionEvent.ACTION_DOWN, px, py, 0
+            )
+            val up = android.view.MotionEvent.obtain(
+                downTime, downTime + 60,
+                android.view.MotionEvent.ACTION_UP, px, py, 0
+            )
+            view.dispatchTouchEvent(down)
+            view.dispatchTouchEvent(up)
+            down.recycle()
+            up.recycle()
+
+            kotlinx.coroutines.delay(600)
+
+            // Read the clipboard natively.
+            //
+            // navigator.clipboard.readText() needs transient activation and a
+            // focused document, and a WebView usually has neither, so it rejects
+            // with NotAllowedError. The platform clipboard service has no such
+            // requirement, and the tap above guarantees the page has written to
+            // it.
+            readSystemClipboard()
+        } catch (e: Exception) {
+            logError("copy: tap failed: ${e.message}")
+            ""
+        }
+    }
+
+    /** Read the system clipboard, or "" if it holds nothing readable. */
+    private fun readSystemClipboard(): String {
+        return try {
+            val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+            val clip = cm.primaryClip ?: return ""
+            if (clip.itemCount == 0) return ""
+            val text = clip.getItemAt(0).coerceToText(this)?.toString().orEmpty()
+            text
+        } catch (e: Exception) {
+            logError("copy: could not read the clipboard: ${e.message}")
+            ""
+        }
+    }
+
     override fun noteStreamedText(text: String, isReasoning: Boolean) {
         webViewBridge?.noteStreamedText(text, isReasoning)
     }

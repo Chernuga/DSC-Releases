@@ -423,6 +423,120 @@ class WebViewBridge(
     }
 
     /**
+     * Scroll the transcript to the bottom and reveal the newest reply.
+     *
+     * The site renders its messages in a virtualised list, so an off-screen
+     * message is not in the DOM at all. Scrolling is therefore a prerequisite
+     * for reading anything, not an optimisation.
+     *
+     * Returns the scroll container's geometry so the caller knows where to look.
+     */
+    suspend fun scrollTranscriptToBottom(): Boolean = withContext(Dispatchers.Main) {
+        val script = """
+            (function(){
+              try {
+                // Every scrollable ancestor of the message list, plus any
+                // element the site marks as a scroll area.
+                var candidates = [];
+                var list = document.querySelector('.ds-virtual-list-items');
+                var node = list;
+                while (node && node !== document.body) {
+                  var s = getComputedStyle(node);
+                  if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight) {
+                    candidates.push(node);
+                  }
+                  node = node.parentElement;
+                }
+                var marked = document.querySelectorAll('.ds-scroll-area, [class*="gutter"]');
+                for (var i = 0; i < marked.length; i++) candidates.push(marked[i]);
+
+                var scrolled = 0;
+                for (var j = 0; j < candidates.length; j++) {
+                  var el = candidates[j];
+                  if (el.scrollHeight > el.clientHeight) {
+                    el.scrollTop = el.scrollHeight;
+                    scrolled++;
+                  }
+                }
+                return scrolled > 0 ? 'true' : 'false';
+              } catch (e) { return 'false'; }
+            })();
+        """.trimIndent()
+        evalJsAwait(script).trim() == "true"
+    }
+
+    /**
+     * Locate the copy control for the newest assistant reply, in page pixels.
+     *
+     * Returns JSON with x/y for a real touch, or an error explaining why the
+     * control could not be found. The button is hover-gated: the site reveals it
+     * only when the message is hovered, and a programmatic click on a hidden
+     * element does nothing (verified - seven buttons were clicked with the
+     * clipboard hooked and nothing was written).
+     */
+    suspend fun locateMessageCopyButton(): String = withContext(Dispatchers.Main) {
+        val script = """
+            (function(){
+              try {
+                function svgPath(el) {
+                  var p = el.querySelector('svg path');
+                  return p ? (p.getAttribute('d') || '') : '';
+                }
+
+                // Reveal hover-only controls by dispatching real mouse events
+                // over each assistant turn, newest first.
+                var turns = document.querySelectorAll('[class*="ds-message"], [class*="message"]');
+                if (!turns.length) return JSON.stringify({ ok: false, error: 'no message nodes in the DOM' });
+
+                function hover(el) {
+                  var r = el.getBoundingClientRect();
+                  var opts = { bubbles: true, cancelable: true, view: window,
+                               clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+                  el.dispatchEvent(new MouseEvent('mouseover', opts));
+                  el.dispatchEvent(new MouseEvent('mouseenter', opts));
+                  el.dispatchEvent(new MouseEvent('mousemove', opts));
+                }
+
+                for (var i = turns.length - 1; i >= 0; i--) {
+                  var t = turns[i];
+                  // The assistant turn is the one carrying rendered markdown or a
+                  // thinking block; the user turn has neither.
+                  if (!t.querySelector('[class*="markdown"], [class*="think"]')) continue;
+                  hover(t);
+
+                  var btns = t.querySelectorAll('.ds-button, [class*="button"]');
+                  for (var j = 0; j < btns.length; j++) {
+                    var b = btns[j];
+                    var aria = (b.getAttribute('aria-label') || '') + ' ' + (b.title || '');
+                    var d = svgPath(b);
+                    // The copy glyph is two overlapping rounded rectangles.
+                    var isCopyGlyph = d.indexOf('9.67272') >= 0 || d.indexOf('M11.748 6.7028') >= 0;
+                    var named = /copy/i.test(aria);
+                    if (!named && !isCopyGlyph) continue;
+                    if (!b.offsetParent) continue;
+
+                    var r = b.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) continue;
+                    return JSON.stringify({
+                      ok: true,
+                      x: Math.round(r.left + r.width / 2),
+                      y: Math.round(r.top + r.height / 2),
+                      named: named,
+                      width: Math.round(r.width),
+                      height: Math.round(r.height)
+                    });
+                  }
+                }
+                return JSON.stringify({ ok: false, error: 'no copy control found on an assistant turn' });
+              } catch (e) {
+                return JSON.stringify({ ok: false, error: String(e) });
+              }
+            })();
+        """.trimIndent()
+        evalJsAwait(script)
+    }
+
+    /**
      * Recover the last assistant reply, as raw text.
      *
      * The stream hook already accumulates the exact characters the page

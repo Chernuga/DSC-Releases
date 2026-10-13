@@ -71,6 +71,16 @@ interface ServerHandler {
     suspend fun isContinueOffered(): Boolean = false
     /** The newest assistant reply already present on the page, or "" if none. */
     suspend fun recoverLastAnswer(): Pair<String, String> = "" to ""
+    /**
+     * Scroll the transcript, tap the page's own copy control and read what it
+     * put on the clipboard.
+     *
+     * This is the only way to obtain the site's authoritative markdown. Its
+     * transcript is virtualised, so an off-screen reply is absent from the DOM
+     * entirely, and the rendered text replaces code fences with the copy and
+     * download controls. The button itself holds the clean string.
+     */
+    suspend fun copyLastReplyViaButton(): String = ""
     /** Record parsed text so the finished answer can be rebuilt from the wire. */
     fun noteStreamedText(text: String, isReasoning: Boolean) {}
     /**
@@ -153,6 +163,23 @@ class LocalHttpServer(
      * so a client can recover from a network failure without spending a turn.
      */
     private fun handleLastResponse(uri: String): Response {
+        // Ask the page for the copy button's own text first.
+        //
+        // This is the site's authoritative markdown - the same string its copy
+        // control writes to the clipboard. Reading the rendered DOM does not
+        // give it: the transcript is virtualised, so an off-screen reply is not
+        // in the DOM at all, and the rendered text has code fences replaced by
+        // the copy/download controls. Only when this fails does the stream
+        // buffer get used, and only then the DOM.
+        val copied = runBlocking {
+            try { handler.copyLastReplyViaButton() } catch (e: Exception) { "" }
+        }
+
+        if (copied.isNotBlank()) {
+            onErrorLogged("/last: took ${copied.length} chars from the page's copy control")
+            return respondWithReply(uri, copied, "", recovered = true)
+        }
+
         val (answer, reasoning) = runBlocking {
             try { handler.recoverLastAnswer() } catch (e: Exception) { "" to "" }
         }
@@ -167,8 +194,22 @@ class LocalHttpServer(
             )
         }
 
-        // The OpenAI-shaped routes get a chat.completion; the simple ones get
-        // {content, ...}.
+        onErrorLogged("/last: recovered ${answer.length} chars from the page")
+        return respondWithReply(uri, answer, reasoning, recovered = true)
+    }
+
+    /**
+     * Wrap a recovered reply in whichever envelope the caller's route expects.
+     *
+     * Shared so the copy-button path and the stream/DOM path cannot drift apart
+     * in shape.
+     */
+    private fun respondWithReply(
+        uri: String,
+        answer: String,
+        reasoning: String,
+        recovered: Boolean
+    ): Response {
         val openAiShape = uri.contains("chat/completions")
         val payload = if (openAiShape) {
             JSONObject().apply {
@@ -176,7 +217,7 @@ class LocalHttpServer(
                 put("object", "chat.completion")
                 put("created", System.currentTimeMillis() / 1000)
                 put("model", "deepseek-web")
-                put("x_recovered", true)
+                put("x_recovered", recovered)
                 put(
                     "choices",
                     JSONArray().put(
@@ -199,11 +240,9 @@ class LocalHttpServer(
             JSONObject().apply {
                 put("content", answer)
                 if (reasoning.isNotBlank()) put("reasoning_content", reasoning)
-                put("x_recovered", true)
+                put("x_recovered", recovered)
             }
         }
-
-        onErrorLogged("/last: recovered ${answer.length} chars from the page")
         return jsonResponse(Response.Status.OK, payload)
     }
 
