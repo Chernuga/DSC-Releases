@@ -1,0 +1,32 @@
+# Build output and tooling caches, at the repository root.
+#
+# The Android project has its own .gitignore inside android/, which covers
+# paths relative to that directory. Because the project now sits in a
+# subdirectory, anything generated at the ROOT - which happens when Gradle is
+# invoked from here - is not covered by it, and build caches and a
+# machine-specific local.properties were committed by accident. This file closes
+# that gap.
+
+# Gradle's own state
+.gradle/
+build/
+
+# Android build output, in case a module is ever built from the root
+*/build/
+**/build/
+*.apk
+*.aab
+
+# Machine-specific: contains an absolute path to this machine's SDK
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
