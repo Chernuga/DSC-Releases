@@ -26,9 +26,12 @@
       "preload.js",
       "preload-ui.js",
       "preload-renderer.js",
-      "renderer/**/*"
+      "renderer/**/*",
+      "assets/icon.ico",
+      "make_icon.py"
     ],
     "win": {
+      "icon": "assets/icon.ico",
       "target": [
         {
           "target": "dir",
