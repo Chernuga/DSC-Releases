@@ -2,29 +2,35 @@
 //
 // Exposes the same bridge the Android app provides - AndroidWorkspace and
 // AndroidLocalProvider - so the website needs no knowledge of which platform it
-// is running on. Every feature the page has (Link Folder, Open, the workspace
-// tree) works here exactly as it does on the phone, because the page sees the
-// same methods with the same names.
+// is running on.
 //
-// The implementation differs: Android uses the Storage Access Framework, where
-// the user grants access to a folder and the app works through content:// URIs.
-// A desktop app needs none of that - it runs as the user and can read the
-// filesystem directly - so a folder here is just a path.
+// SYNCHRONOUS ON PURPOSE.
 //
-// contextIsolation stays ON. These objects are handed to the page deliberately,
-// through contextBridge, rather than by weakening isolation; the page gets the
-// handful of methods listed here and nothing else, no Node and no ipcRenderer.
+// Android's @JavascriptInterface methods return a value directly, so the page
+// calls them without awaiting:
+//
+//     picked = JSON.parse(bridge.pickFolder());
+//
+// A contextBridge method returns a Promise. JSON.parse(Promise) throws, which is
+// why linking a folder failed here with "Folder picker failed" even though the
+// picker itself had worked. ipcRenderer.sendSync blocks for the real value, so
+// these methods behave exactly like Android's and the page runs unchanged.
+//
+// The work is all local filesystem access that completes in milliseconds; the one
+// genuinely slow call - the folder picker - blocks only while the user is choosing,
+// which is inherent to a modal dialog.
+//
+// contextIsolation stays ON: the page gets the methods listed here and nothing
+// else. No Node, no ipcRenderer, no filesystem beyond the linked folder.
 
 const { contextBridge, ipcRenderer } = require("electron");
 
-// Every call crosses to the main process, which does the filesystem work. The
-// results are JSON strings, matching the Android bridge's shape so the page's
-// existing parsing works unchanged.
-const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
+/** Call the main process and return its result as Android would: directly. */
+const call = (channel, ...args) => ipcRenderer.sendSync(channel, ...args);
 
 contextBridge.exposeInMainWorld("AndroidWorkspace", {
   /** Open the system folder picker and remember the choice. */
-  pickFolder: () => invoke("workspace:pickFolder"),
+  pickFolder: () => call("workspace:pickFolder"),
 
   /**
    * Re-attach to a folder after a restart.
@@ -32,24 +38,24 @@ contextBridge.exposeInMainWorld("AndroidWorkspace", {
    * Android must re-assert a saved permission here; a desktop app only needs to
    * confirm the path still exists, which the main process does.
    */
-  restoreFolder: (id, pathOrUri) => invoke("workspace:restoreFolder", id, pathOrUri),
+  restoreFolder: (id, pathOrUri) => call("workspace:restoreFolder", id, pathOrUri),
 
   /** Every file in the folder, recursively, as relative paths. */
-  listFiles: (id) => invoke("workspace:listFiles", id),
+  listFiles: (id) => call("workspace:listFiles", id),
 
   /** One file, base64 encoded so binary content survives the crossing. */
-  readFile: (id, relativePath) => invoke("workspace:readFile", id, relativePath),
+  readFile: (id, relativePath) => call("workspace:readFile", id, relativePath),
 
   /** Write a file, creating parent folders as needed. */
   writeFile: (id, relativePath, base64) =>
-    invoke("workspace:writeFile", id, relativePath, base64),
+    call("workspace:writeFile", id, relativePath, base64),
 
   /** Delete a file inside the folder. */
-  deleteFile: (id, relativePath) => invoke("workspace:deleteFile", id, relativePath),
+  deleteFile: (id, relativePath) => call("workspace:deleteFile", id, relativePath),
 
   /** Hand a file to the system's default application. */
   openFile: (id, relativePath, mimeType, contentBase64) =>
-    invoke("workspace:openFile", id, relativePath, mimeType, contentBase64),
+    call("workspace:openFile", id, relativePath, mimeType, contentBase64),
 });
 
 // The page checks for this before showing the fetch-last button, and uses it to

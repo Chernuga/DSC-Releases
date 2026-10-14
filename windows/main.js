@@ -5,7 +5,15 @@
 // The layout difference is that a desktop window switches views from a tab
 // strip rather than swiping.
 
-const { app, BrowserWindow, WebContentsView, ipcMain, shell, dialog } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  WebContentsView,
+  ipcMain,
+  shell,
+  dialog,
+  clipboard,
+} = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { startApi } = require("./api");
@@ -377,21 +385,52 @@ function listFilesRecursive(root, dir = root, out = []) {
 const j = (obj) => JSON.stringify(obj);
 const jErr = (message) => JSON.stringify({ ok: false, error: message });
 
-ipcMain.handle("workspace:pickFolder", async () => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+// These are synchronous, on purpose.
+//
+// The page calls the bridge the way it calls Android's @JavascriptInterface
+// methods - without awaiting, because those return a value directly:
+//
+//     picked = JSON.parse(bridge.pickFolder());
+//
+// contextBridge methods return Promises, so JSON.parse(Promise) threw and linking
+// a folder reported "Folder picker failed" even though the picker itself had
+// worked. ipcRenderer.sendSync + event.returnValue reproduces Android's behaviour
+// exactly, so the page runs unchanged on both platforms.
+//
+// The work is local filesystem access that finishes in milliseconds. The picker
+// blocks only while the dialog is open, which is inherent to a modal.
+
+/** Wrap a synchronous handler: run it, then hand the result back to sendSync. */
+function onSync(channel, fn) {
+  ipcMain.on(channel, (event, ...args) => {
+    try {
+      event.returnValue = fn(...args);
+    } catch (e) {
+      // Never leave the channel hanging: sendSync would block the renderer
+      // forever if returnValue were left unset.
+      event.returnValue = jErr(`${channel} failed: ${e.message}`);
+    }
+  });
+}
+
+onSync("workspace:pickFolder", () => {
+  // showOpenDialog is async; block here until the user has chosen. sendSync
+  // requires a value before returning, and a modal picker is a blocking
+  // interaction by nature.
+  const result = dialog.showOpenDialogSync(mainWindow, {
     title: "Choose a folder to link",
     properties: ["openDirectory", "createDirectory"],
   });
-  if (result.canceled || !result.filePaths.length) {
+  if (!result || !result.length) {
     return jErr("Folder selection was cancelled.");
   }
-  const folder = result.filePaths[0];
+  const folder = result[0];
   const id = "ws" + Date.now().toString(36);
   linkedFolders.set(id, folder);
   return j({ ok: true, id, name: path.basename(folder) || folder, uri: folder });
 });
 
-ipcMain.handle("workspace:restoreFolder", async (_e, id, folderPath) => {
+onSync("workspace:restoreFolder", (id, folderPath) => {
   try {
     const stat = fs.statSync(folderPath);
     if (!stat.isDirectory()) return jErr("That path is not a folder.");
@@ -402,7 +441,7 @@ ipcMain.handle("workspace:restoreFolder", async (_e, id, folderPath) => {
   }
 });
 
-ipcMain.handle("workspace:listFiles", async (_e, id) => {
+onSync("workspace:listFiles", (id) => {
   const root = linkedFolders.get(id);
   if (!root) return jErr("No folder is linked.");
   try {
@@ -412,7 +451,7 @@ ipcMain.handle("workspace:listFiles", async (_e, id) => {
   }
 });
 
-ipcMain.handle("workspace:readFile", async (_e, id, relativePath) => {
+onSync("workspace:readFile", (id, relativePath) => {
   const root = linkedFolders.get(id);
   if (!root) return jErr("No folder is linked.");
   const full = safeJoin(root, relativePath);
@@ -425,7 +464,7 @@ ipcMain.handle("workspace:readFile", async (_e, id, relativePath) => {
   }
 });
 
-ipcMain.handle("workspace:writeFile", async (_e, id, relativePath, base64) => {
+onSync("workspace:writeFile", (id, relativePath, base64) => {
   const root = linkedFolders.get(id);
   if (!root) return jErr("No folder is linked.");
   const full = safeJoin(root, relativePath);
@@ -440,7 +479,7 @@ ipcMain.handle("workspace:writeFile", async (_e, id, relativePath, base64) => {
   }
 });
 
-ipcMain.handle("workspace:deleteFile", async (_e, id, relativePath) => {
+onSync("workspace:deleteFile", (id, relativePath) => {
   const root = linkedFolders.get(id);
   if (!root) return jErr("No folder is linked.");
   const full = safeJoin(root, relativePath);
@@ -453,27 +492,24 @@ ipcMain.handle("workspace:deleteFile", async (_e, id, relativePath) => {
   }
 });
 
-ipcMain.handle("workspace:openFile", async (_e, id, relativePath, mimeType, contentBase64) => {
+onSync("workspace:openFile", (id, relativePath, mimeType, contentBase64) => {
   const root = id ? linkedFolders.get(id) : null;
   try {
+    let target;
     if (root) {
-      const full = safeJoin(root, relativePath);
-      if (!full) return jErr("That path is outside the linked folder.");
-      // Opening from disk rather than a copy, so a page's relative links to its
-      // sibling files resolve.
-      const err = await shell.openPath(full);
-      if (err) return jErr(err);
-      return j({ ok: true });
+      target = safeJoin(root, relativePath);
+      if (!target) return jErr("That path is outside the linked folder.");
+    } else {
+      // No folder linked: write the workspace copy somewhere temporary so the
+      // default application has a real file to open.
+      const dir = path.join(app.getPath("temp"), "deepseek-code-preview");
+      fs.mkdirSync(dir, { recursive: true });
+      target = path.join(dir, path.basename(relativePath));
+      fs.writeFileSync(target, Buffer.from(String(contentBase64 || ""), "base64"));
     }
-
-    // No folder linked: write the workspace copy somewhere temporary so the
-    // default application has a real file to open.
-    const dir = path.join(app.getPath("temp"), "deepseek-code-preview");
-    fs.mkdirSync(dir, { recursive: true });
-    const full = path.join(dir, path.basename(relativePath));
-    fs.writeFileSync(full, Buffer.from(String(contentBase64 || ""), "base64"));
-    const err = await shell.openPath(full);
-    if (err) return jErr(err);
+    // Handing the path to the OS rather than awaiting it: the file exists and
+    // opening it is the shell's business, so there is nothing to wait for.
+    shell.openPath(target).catch((e) => log(`Could not open ${relativePath}: ${e}`));
     return j({ ok: true });
   } catch (e) {
     return jErr(`Could not open ${relativePath}: ${e.message}`);
@@ -558,6 +594,79 @@ async function stopServer() {
  */
 const INACTIVITY_TIMEOUT_MS = 120_000;
 
+/**
+ * Bring the DeepSeek view on screen, returning a function that puts it back.
+ *
+ * Windows' equivalent of the Android GONE/INVISIBLE fix. The transcript is
+ * rendered in a virtualised list, which produces no rows at all in a view with no
+ * size - and a parked view has none. So the view is shown for the duration of the
+ * copy, then restored to whatever it was.
+ *
+ * The restore is returned rather than performed by the caller, so it runs even if
+ * the copy throws.
+ */
+function parkOtherViewsForCopy() {
+  const previous = activeView;
+  const wasDeepseek = previous === "deepseek";
+
+  // A tab switch, not a window: the UI simply ends up on the DeepSeek tab for a
+  // moment. Nothing is destroyed and the session is untouched.
+  if (!wasDeepseek) setActiveView("deepseek");
+
+  return () => {
+    if (!wasDeepseek) setActiveView(previous);
+  };
+}
+
+/**
+ * Drive the page's own copy control and return what it put on the clipboard.
+ *
+ * The sequence, ported from Android where it was measured into existence:
+ * scroll to the bottom (an off-screen reply is not in the DOM at all), find the
+ * control, click it, then read the clipboard.
+ *
+ * The click is a real synthetic one at the control's coordinates. A programmatic
+ * .click() on a hover-gated control does nothing - that was measured on Android,
+ * seven buttons clicked with the clipboard hooked and nothing written.
+ */
+async function copyLastReplyViaButton(wc) {
+  try {
+    await wc.executeJavaScript(
+      "window.__dsPage && window.__dsPage.scrollTranscriptToBottom()",
+      true
+    );
+    // Give the virtualised list a moment to render the rows it just scrolled to.
+    await new Promise((r) => setTimeout(r, 400));
+
+    const located = await wc.executeJavaScript(
+      "window.__dsPage ? window.__dsPage.locateMessageCopyButton() : {ok:false,error:'no hook'}",
+      true
+    );
+    if (!located || !located.ok) {
+      log(`copy: ${(located && located.error) || "copy control not found"}`);
+      return "";
+    }
+
+    // Record the clipboard first, so a stale value can be told from a fresh one.
+    const before = clipboard.readText();
+
+    wc.sendInputEvent({ type: "mouseDown", x: located.x, y: located.y, button: "left", clickCount: 1 });
+    wc.sendInputEvent({ type: "mouseUp", x: located.x, y: located.y, button: "left", clickCount: 1 });
+
+    // The page writes asynchronously; poll briefly rather than guessing a delay.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const now = clipboard.readText();
+      if (now && now !== before) return now;
+    }
+    log("copy: the clipboard never changed, so the control did not fire");
+    return "";
+  } catch (e) {
+    log(`copy: ${e.message}`);
+    return "";
+  }
+}
+
 const handlers = {
   isEnabled: () => state.apiEnabled,
   log,
@@ -633,15 +742,49 @@ const handlers = {
     }
   },
 
-  /** The most recent reply, read from the hook's buffer without re-running it. */
+  /**
+   * The most recent reply, read without re-running it.
+   *
+   * Two sources, in the order Android uses:
+   *
+   *  1. The page's own copy control, driven by a real synthetic click. This works
+   *     for ANY conversation on screen, including one opened from the sidebar -
+   *     which is the case that matters, because the hook's buffer only fills when
+   *     this app sent the prompt.
+   *
+   *  2. The hook's buffer, for when the click finds no control - a reply still
+   *     streaming, or a page whose layout has moved on from the measured one.
+   *
+   * The clipboard is read through Electron rather than the page's API: a
+   * clipboard read from page script needs transient activation and a focused
+   * document, and neither is dependable inside a WebContentsView.
+   */
   async lastReply() {
     if (!deepseekView || deepseekView.webContents.isDestroyed()) {
       throw new Error("The DeepSeek page is not available.");
     }
-    return await deepseekView.webContents.executeJavaScript(
-      "window.__dsPage ? window.__dsPage.lastReply() : null",
-      true
-    );
+    const wc = deepseekView.webContents;
+
+    // The page must be able to render its transcript, and a parked view has no
+    // size, so bring it on screen for the duration.
+    const restore = parkOtherViewsForCopy();
+    try {
+      const copied = await copyLastReplyViaButton(wc);
+      if (copied) {
+        log(`/last: took ${copied.length} chars from the page's copy control`);
+        return { content: copied, reasoning: "" };
+      }
+      const buffered = await wc.executeJavaScript(
+        "window.__dsPage ? window.__dsPage.lastReply() : null",
+        true
+      );
+      if (buffered && (buffered.content || buffered.reasoning)) {
+        log(`/last: fell back to the captured stream (${(buffered.content || "").length} chars)`);
+      }
+      return buffered;
+    } finally {
+      restore();
+    }
   },
 
   /** Whether the page is offering its Continue control. */

@@ -342,17 +342,117 @@
     },
 
     /**
+     * Scroll the transcript to the bottom.
+     *
+     * The site renders messages in a virtualised list, so an off-screen reply is
+     * not in the DOM at all. Scrolling is a prerequisite for reading anything,
+     * not a nicety.
+     */
+    scrollTranscriptToBottom() {
+      try {
+        const candidates = [];
+        const list = document.querySelector(".ds-virtual-list-items");
+        let node = list;
+        while (node && node !== document.body) {
+          const s = getComputedStyle(node);
+          if (/(auto|scroll)/.test(s.overflowY) && node.scrollHeight > node.clientHeight) {
+            candidates.push(node);
+          }
+          node = node.parentElement;
+        }
+        const marked = document.querySelectorAll('.ds-scroll-area, [class*="gutter"]');
+        for (const el of marked) candidates.push(el);
+
+        let scrolled = 0;
+        for (const el of candidates) {
+          if (el.scrollHeight > el.clientHeight) {
+            el.scrollTop = el.scrollHeight;
+            scrolled++;
+          }
+        }
+        return scrolled > 0;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    /**
+     * Locate the copy control for the newest assistant reply.
+     *
+     * Returns {ok, x, y} in page pixels, for a real synthetic click. Ported
+     * unchanged from the Android build, where the measurements behind it were
+     * taken: the rows live in .ds-virtual-list-visible-items, and the
+     * message-level control is the LAST button carrying the copy glyph, because
+     * the per-thinking-block and per-code-block copies wear the same icon.
+     */
+    locateMessageCopyButton() {
+      try {
+        const svgPath = (el) => {
+          const p = el.querySelector("svg path");
+          return p ? p.getAttribute("d") || "" : "";
+        };
+
+        let rows = document.querySelectorAll(".ds-virtual-list-visible-items > *");
+        if (!rows.length) rows = document.querySelectorAll(".ds-virtual-list-items > *");
+        if (!rows.length) {
+          return { ok: false, error: "no message rows rendered" };
+        }
+
+        const hover = (el) => {
+          const r = el.getBoundingClientRect();
+          const o = {
+            bubbles: true, cancelable: true, view: window,
+            clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+          };
+          el.dispatchEvent(new MouseEvent("mouseover", o));
+          el.dispatchEvent(new MouseEvent("mouseenter", o));
+          el.dispatchEvent(new MouseEvent("mousemove", o));
+        };
+
+        const COPY_GLYPH = "M6.14929 4.02032";
+
+        let best = null;
+        for (let i = 0; i < rows.length; i++) {
+          // Reveal hover-only controls before looking for them.
+          hover(rows[i]);
+          const btns = rows[i].querySelectorAll(".ds-button");
+          for (const b of btns) {
+            const aria = (b.getAttribute("aria-label") || "") + " " + (b.title || "");
+            const named = /copy/i.test(aria);
+            const isGlyph = svgPath(b).indexOf(COPY_GLYPH) === 0;
+            if (!named && !isGlyph) continue;
+            if (!b.offsetParent) continue;
+            const r = b.getBoundingClientRect();
+            if (r.width < 1 || r.height < 1) continue;
+            // Later matches overwrite earlier ones, so the final assignment is
+            // the message-level control.
+            best = {
+              x: Math.round(r.left + r.width / 2),
+              y: Math.round(r.top + r.height / 2),
+              named,
+              row: i,
+            };
+          }
+        }
+        if (!best) return { ok: false, error: "no copy control found" };
+        best.ok = true;
+        return best;
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    },
+
+    /**
      * The most recent reply, as raw text.
      *
      * Prefers the buffer this hook filled from the wire, which holds exactly the
      * characters the page received - the same string the site's own copy button
-     * writes to the clipboard, code fences and file-command markers included.
-     * The rendered DOM is NOT equivalent: it replaces fences with the copy and
-     * download controls, so a reply recovered from it cannot drive file edits.
+     * writes to the clipboard. The rendered DOM is NOT equivalent: it replaces
+     * fences with the copy and download controls.
      *
-     * The buffer is kept after a request finishes, so a reply can still be
-     * recovered once the call that produced it has ended - which is the whole
-     * point of the endpoint.
+     * The buffer only fills when THIS app sent the prompt. Opening an older
+     * conversation leaves it empty, which is why the caller falls back to
+     * driving the page's own copy control.
      */
     lastReply() {
       return { content: contentBuf, reasoning: reasoningBuf };
