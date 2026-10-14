@@ -255,6 +255,8 @@ function createRemoteViews() {
 
 
 
+
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);
@@ -831,17 +833,45 @@ const handlers = {
         log(`/last: took ${copied.length} chars from the page's copy control`);
         return { content: copied, reasoning: "" };
       }
-      log(`/last: no copy control result, falling back to the buffer`);
+      // Nothing to copy. Find out why, so the caller can say something useful
+      // rather than appearing to do nothing.
+      const state = await wc.executeJavaScript(
+        [
+          "(function(){",
+          "  var rows = document.querySelectorAll('.ds-virtual-list-visible-items > *').length;",
+          "  var onChat = /\\/a\\/chat\\/s\\//.test(location.pathname);",
+          "  return JSON.stringify({ url: location.href, onChat: onChat, rows: rows });",
+          "})()",
+        ].join("\n"),
+        true
+      ).catch(() => null);
+
       const buffered = await wc.executeJavaScript(
         "window.__dsPage ? window.__dsPage.lastReply() : null",
         true
       );
       if (buffered && (buffered.content || buffered.reasoning)) {
         log(`/last: fell back to the captured stream (${(buffered.content || "").length} chars)`);
-      } else {
-        log(`/last: the buffer is empty too`);
+        return buffered;
       }
-      return buffered;
+
+      let reason = "The page has no assistant reply to read.";
+      try {
+        const st = JSON.parse(state || "{}");
+        if (!st.onChat) {
+          reason =
+            "No conversation is open on the DeepSeek tab. Open one from its " +
+            "sidebar, then fetch again.";
+        } else if (!st.rows) {
+          reason =
+            "The conversation is open but has not finished rendering. Wait a " +
+            "moment, then fetch again.";
+        }
+      } catch (e) {
+        /* keep the generic message */
+      }
+      log(`/last: ${reason}`);
+      throw new Error(reason);
     } finally {
       restore();
     }
