@@ -103,7 +103,7 @@ api.onState(render);
 // Initial paint.
 api.getState().then(render);
 api.getUrls().then((u) => {
-  document.title = "DeepSeek Standalone";
+  document.title = "DeepSeek Code";
   void u;
 });
 

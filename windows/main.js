@@ -151,6 +151,17 @@ function rememberChatUrl(url) {
   const clean = u.split("?")[0].split("#")[0];
   try {
     if (fs.readFileSync(lastChatPath(), "utf8").trim() === clean) return;
+  } catch (e) {
+    // Missing file is the normal first-run case, not an error worth reporting.
+  }
+  try {
+    // The directory is created here rather than assumed.
+    //
+    // Electron creates userData for its own files, but this write is ours, and on
+    // a first run the folder does not exist yet - so the write failed with ENOENT
+    // and the remembered conversation was never stored. The resume feature then
+    // found nothing on every launch, which looked like the watcher not working.
+    fs.mkdirSync(path.dirname(lastChatPath()), { recursive: true });
     fs.writeFileSync(lastChatPath(), clean, "utf8");
   } catch (e) {
     log(`Could not record the conversation URL: ${e.message}`);
@@ -241,6 +252,7 @@ function createRemoteViews() {
   });
   webUiView.webContents.loadURL(WEB_UI_URL);
 
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);
@@ -301,6 +313,7 @@ function seedLocalProviderScript() {
  * different parent, and removing it would destroy the DeepSeek session.
  */
 let lastBounds = null;
+
 let activeView = "deepseek";
 const PARKED = { x: -20000, y: 0, width: 800, height: 600 };
 
@@ -526,7 +539,7 @@ function createWindow() {
     minHeight: 640,
     show: false,
     backgroundColor: "#12141a",
-    title: "DeepSeek Standalone",
+    title: "DeepSeek Code",
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload-renderer.js"),
@@ -595,27 +608,20 @@ async function stopServer() {
 const INACTIVITY_TIMEOUT_MS = 120_000;
 
 /**
- * Bring the DeepSeek view on screen, returning a function that puts it back.
+ * No tab switch is needed for the copy.
  *
- * Windows' equivalent of the Android GONE/INVISIBLE fix. The transcript is
- * rendered in a virtualised list, which produces no rows at all in a view with no
- * size - and a parked view has none. So the view is shown for the duration of the
- * copy, then restored to whatever it was.
+ * This used to show the DeepSeek view for the duration, copying the Android
+ * reasoning without checking whether Windows shared the constraint. It does not:
+ * a parked WebContentsView keeps a real size - measured at 1304x788 while parked,
+ * reporting itself visible - so the page renders regardless of what is on screen.
+ * And sendInputEvent delivers to the WebContents directly rather than through the
+ * window, so the click lands either way.
  *
- * The restore is returned rather than performed by the caller, so it runs even if
- * the copy throws.
+ * Kept rather than inlined so callers keep their shape, and so the reason there is
+ * nothing to restore is on record.
  */
 function parkOtherViewsForCopy() {
-  const previous = activeView;
-  const wasDeepseek = previous === "deepseek";
-
-  // A tab switch, not a window: the UI simply ends up on the DeepSeek tab for a
-  // moment. Nothing is destroyed and the session is untouched.
-  if (!wasDeepseek) setActiveView("deepseek");
-
-  return () => {
-    if (!wasDeepseek) setActiveView(previous);
-  };
+  return () => {};
 }
 
 /**
@@ -631,7 +637,7 @@ function parkOtherViewsForCopy() {
  */
 async function copyLastReplyViaButton(wc) {
   try {
-    await wc.executeJavaScript(
+    const scrolled = await wc.executeJavaScript(
       "window.__dsPage && window.__dsPage.scrollTranscriptToBottom()",
       true
     );
@@ -643,9 +649,13 @@ async function copyLastReplyViaButton(wc) {
       true
     );
     if (!located || !located.ok) {
-      log(`copy: ${(located && located.error) || "copy control not found"}`);
+      log(
+        `copy: could not find the control (${(located && located.error) || "unknown"}); ` +
+          `scrolled=${scrolled}`
+      );
       return "";
     }
+    log(`copy: control at ${located.x},${located.y} (row ${located.row}, scrolled=${scrolled})`);
 
     // Record the clipboard first, so a stale value can be told from a fresh one.
     const before = clipboard.readText();
@@ -657,9 +667,15 @@ async function copyLastReplyViaButton(wc) {
     for (let i = 0; i < 20; i++) {
       await new Promise((r) => setTimeout(r, 100));
       const now = clipboard.readText();
-      if (now && now !== before) return now;
+      if (now && now !== before) {
+        log(`copy: the clipboard changed after ${(i + 1) * 100}ms`);
+        return now;
+      }
     }
-    log("copy: the clipboard never changed, so the control did not fire");
+    log(
+      `copy: the clipboard never changed at that point ` +
+        `(was ${before.length} chars, still ${clipboard.readText().length})`
+    );
     return "";
   } catch (e) {
     log(`copy: ${e.message}`);
@@ -774,12 +790,15 @@ const handlers = {
         log(`/last: took ${copied.length} chars from the page's copy control`);
         return { content: copied, reasoning: "" };
       }
+      log(`/last: no copy control result, falling back to the buffer`);
       const buffered = await wc.executeJavaScript(
         "window.__dsPage ? window.__dsPage.lastReply() : null",
         true
       );
       if (buffered && (buffered.content || buffered.reasoning)) {
         log(`/last: fell back to the captured stream (${(buffered.content || "").length} chars)`);
+      } else {
+        log(`/last: the buffer is empty too`);
       }
       return buffered;
     } finally {
