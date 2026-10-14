@@ -1052,7 +1052,7 @@ class WebViewBridge(
             (function(){
               function cls(e){ return (e && e.className && typeof e.className === 'string') ? e.className : ''; }
               function txt(e){ return ((e && (e.innerText || e.textContent)) || '').trim(); }
-              function short(s, n){ s = s || ''; return s.length > n ? s.slice(0, n) + 'â€¦' : s; }
+              function short(s, n){ s = s || ''; return s.length > n ? s.slice(0, n) + '...' : s; }
 
               var out = { counts: {}, messages: [], pickedAnswer: null, pickedReasoning: null };
 
