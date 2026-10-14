@@ -1,7 +1,10 @@
 # Releases
 
-APKs are attached to [GitHub Releases](../../releases). Hashes are listed here so
-a download can be verified before installing.
+APKs are attached to [GitHub Releases](../../releases), and the current build is
+also kept at [`android/app-debug.apk`](../android/app-debug.apk) so it can be
+downloaded straight from the repository.
+
+Hashes are listed here so a download can be verified before installing.
 
 ## Verify
 
@@ -11,11 +14,20 @@ Get-FileHash .\app-debug.apk -Algorithm SHA256
 
 The value must match the entry for the version you downloaded.
 
+## v1.2 — 2026-10-14
+
+| | |
+|---|---|
+| File | `android/app-debug.apk` |
+| Size | 12.4 MB |
+| SHA-256 | `c6cf883b8dcea26e3191ff2f86eaccd39f7f6b27b5bc8206ee4e8ee50ec27db5` |
+| Notes | Storage: a change records only what it did, not a copy of the file, and earlier conversations are trimmed on load. Revert removed. |
+
 ## v1.1 — 2026-10-13
 
 | | |
 |---|---|
-| File | `app-debug.apk` |
+| File | `app-debug.apk` (release asset only) |
 | Size | 12.2 MB |
 | SHA-256 | `d7b4d5ffe1055c2cbd7a17f40208047f615e4834cb5b1d1e9191c6690997d204` |
 | Notes | The linked folder survives a restart; the app reopens the last conversation. |
@@ -24,7 +36,7 @@ The value must match the entry for the version you downloaded.
 
 | | |
 |---|---|
-| File | `app-debug.apk` |
+| File | `app-debug.apk` (release asset only) |
 | Size | 12.7 MB |
 | SHA-256 | `078090f5736cf6975db2d89b16d262ec2bab63c4eb0e361fe8bc80068c3b3948` |
 | Notes | First published build. GLM defaults to the free model; fetch-last reads the page's copy control; immediate non-destructive saving. |

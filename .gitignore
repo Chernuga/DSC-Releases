@@ -17,6 +17,10 @@ build/
 *.apk
 *.aab
 
+# ...except the published build, which is kept in the tree on purpose so the
+# app is downloadable straight from the repository as well as from Releases.
+!android/app-debug.apk
+
 # Machine-specific: contains an absolute path to this machine's SDK
 local.properties
 

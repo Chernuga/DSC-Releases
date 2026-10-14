@@ -10,9 +10,21 @@ workspace.
 ## Layout
 
 ```
-android/            the Android project (open this in Android Studio)
-releases/           notes and checksums for published builds
+android/                  the Android project (open this in Android Studio)
+android/app-debug.apk     the current build, ready to install
+releases/                 notes and checksums for published builds
 ```
+
+## Install
+
+Download [`android/app-debug.apk`](android/app-debug.apk), or from
+[Releases](../../releases), then:
+
+```bash
+adb install -r app-debug.apk
+```
+
+Signed with the debug keystore (v2 scheme, Android 7+).
 
 ## Building
 
@@ -24,33 +36,23 @@ echo "sdk.dir=/path/to/Android/Sdk" > local.properties   # gitignored
 ./gradlew assembleDebug
 ```
 
-The APK lands in `android/app/build/outputs/apk/debug/app-debug.apk`.
-
-Install it with:
-
-```bash
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
-```
+The APK lands in `android/app/build/outputs/apk/debug/app-debug.apk`. Copy it over
+`android/app-debug.apk` to refresh the published copy — see
+[`android/PUBLISHING.md`](android/PUBLISHING.md).
 
 ## Signing
 
-Release builds are signed with the **debug keystore**, which is intentional for a
-personal build: it installs and updates cleanly on a device that already has the
-debug build, and needs no secret in the repo.
+The debug keystore is used deliberately for a personal build: it installs and
+updates cleanly over an existing debug build and needs no secret in the repo.
 
-The consequence is worth knowing: the debug keystore differs per machine, so a
-build made on another computer will **not** install over this one — Android
-rejects it as a different signer. Uninstall first, or keep building from the same
-machine.
-
-The APK is signed with the v2 scheme only, which covers Android 7.0 and later.
+The consequence is worth knowing: the keystore differs per machine, so a build
+made on another computer will **not** install over this one — Android rejects it
+as a different signer. Uninstall first, or keep building from the same machine.
 
 ## Releases
 
-Published APKs are attached to GitHub Releases and listed in
-[`releases/`](releases/) with their SHA-256 checksums.
-
-Verify a download before installing:
+Published APKs are attached to GitHub Releases and recorded in
+[`releases/`](releases/) with their SHA-256 checksums. Verify before installing:
 
 ```powershell
 Get-FileHash .\app-debug.apk -Algorithm SHA256
