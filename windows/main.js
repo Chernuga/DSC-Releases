@@ -687,10 +687,32 @@ async function copyLastReplyViaButton(wc) {
     // Give the virtualised list a moment to render the rows it just scrolled to.
     await new Promise((r) => setTimeout(r, 400));
 
-    const located = await wc.executeJavaScript(
+    // Hover separately, then let the page render before searching.
+    //
+    // The site reveals its hover controls on React's next render. Hovering and
+    // searching in one call meant the search could run before the control existed,
+    // which fits the report that the newest message fails - its controls sit
+    // against the composer and are the last to appear.
+    await wc.executeJavaScript(
+      "window.__dsPage && window.__dsPage.hoverRows()",
+      true
+    );
+    await new Promise((r) => setTimeout(r, 250));
+
+    let located = await wc.executeJavaScript(
       "window.__dsPage ? window.__dsPage.locateMessageCopyButton() : {ok:false,error:'no hook'}",
       true
     );
+
+    // One retry, for a list still settling after the scroll.
+    if (!located || !located.ok) {
+      await new Promise((r) => setTimeout(r, 400));
+      located = await wc.executeJavaScript(
+        "window.__dsPage ? window.__dsPage.locateMessageCopyButton() : {ok:false,error:'no hook'}",
+        true
+      );
+    }
+
     if (!located || !located.ok) {
       log(
         `copy: could not find the control (${(located && located.error) || "unknown"}); ` +
@@ -855,7 +877,11 @@ const handlers = {
         return buffered;
       }
 
-      let reason = "The page has no assistant reply to read.";
+      // The remedy the user asked for. The page can end up in a state where the
+      // newest message's controls are not reachable - they sit against the
+      // composer and are the last to appear - and a restart clears it.
+      let reason =
+        "Could not read the newest message. Please restart the app and try again.";
       try {
         const st = JSON.parse(state || "{}");
         if (!st.onChat) {
@@ -864,11 +890,11 @@ const handlers = {
             "sidebar, then fetch again.";
         } else if (!st.rows) {
           reason =
-            "The conversation is open but has not finished rendering. Wait a " +
-            "moment, then fetch again.";
+            "The conversation is open but has not finished rendering. " +
+            "Please restart the app and try again.";
         }
       } catch (e) {
-        /* keep the generic message */
+        /* keep the restart message */
       }
       log(`/last: ${reason}`);
       throw new Error(reason);

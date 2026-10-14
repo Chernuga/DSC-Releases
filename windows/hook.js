@@ -377,6 +377,34 @@
     },
 
     /**
+     * Reveal the hover-only controls on every rendered row.
+     *
+     * Separate from the search on purpose: the site shows its controls on React's
+     * next render, so a caller that hovers and searches in one tick can look
+     * before the control exists. Hovering here, waiting, then searching is what
+     * gives the newest message's controls time to appear.
+     */
+    hoverRows() {
+      try {
+        let rows = document.querySelectorAll(".ds-virtual-list-visible-items > *");
+        if (!rows.length) rows = document.querySelectorAll(".ds-virtual-list-items > *");
+        for (const el of rows) {
+          const r = el.getBoundingClientRect();
+          const o = {
+            bubbles: true, cancelable: true, view: window,
+            clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
+          };
+          el.dispatchEvent(new MouseEvent("mouseover", o));
+          el.dispatchEvent(new MouseEvent("mouseenter", o));
+          el.dispatchEvent(new MouseEvent("mousemove", o));
+        }
+        return rows.length;
+      } catch (e) {
+        return 0;
+      }
+    },
+
+    /**
      * Locate the copy control for the newest assistant reply.
      *
      * Returns {ok, x, y} in page pixels, for a real synthetic click. Ported
@@ -398,23 +426,10 @@
           return { ok: false, error: "no message rows rendered" };
         }
 
-        const hover = (el) => {
-          const r = el.getBoundingClientRect();
-          const o = {
-            bubbles: true, cancelable: true, view: window,
-            clientX: r.left + r.width / 2, clientY: r.top + r.height / 2,
-          };
-          el.dispatchEvent(new MouseEvent("mouseover", o));
-          el.dispatchEvent(new MouseEvent("mouseenter", o));
-          el.dispatchEvent(new MouseEvent("mousemove", o));
-        };
-
         const COPY_GLYPH = "M6.14929 4.02032";
 
         let best = null;
         for (let i = 0; i < rows.length; i++) {
-          // Reveal hover-only controls before looking for them.
-          hover(rows[i]);
           const btns = rows[i].querySelectorAll(".ds-button");
           for (const b of btns) {
             const aria = (b.getAttribute("aria-label") || "") + " " + (b.title || "");
