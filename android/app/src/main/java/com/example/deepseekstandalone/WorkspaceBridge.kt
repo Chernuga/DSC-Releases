@@ -84,22 +84,42 @@ class WorkspaceBridge(private val activity: MainActivity) {
         }
 
         val uri = pickerResult!!
-        // Persist the permission so the folder stays usable after a restart.
+        // Persist the permission so the folder stays usable after a restart, and
+        // find out whether that actually worked.
+        val durable = takePersistentGrant(uri)
+
+        val id = "ws" + System.currentTimeMillis().toString(36)
+        folders[id] = uri
+
+        val doc = DocumentFile.fromTreeUri(activity, uri)
+        return """{"ok":true,"id":"$id","name":${jsonString(doc?.name ?: "Folder")},"uri":${jsonString(uri.toString())},"durable":$durable}"""
+    }
+
+    /**
+     * Take a persistable grant on a tree, then confirm it was actually taken.
+     *
+     * Asking for a persistable permission is not the same as holding one: some
+     * providers refuse outright and takePersistableUriPermission throws. Reading
+     * the provider's own list afterwards is the only way to know, and without it
+     * the app reported success for access it did not durably have - so the folder
+     * worked until the app was killed and then failed, with nothing to explain why.
+     */
+    private fun takePersistentGrant(uri: Uri): Boolean {
         try {
             activity.contentResolver.takePersistableUriPermission(
                 uri,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
         } catch (e: SecurityException) {
-            // Some providers do not offer persistable grants; the folder still
-            // works for this session.
+            // Already held, or refused. The check below decides which.
         }
-
-        val id = "ws" + System.currentTimeMillis().toString(36)
-        folders[id] = uri
-
-        val doc = DocumentFile.fromTreeUri(activity, uri)
-        return """{"ok":true,"id":"$id","name":${jsonString(doc?.name ?: "Folder")},"uri":${jsonString(uri.toString())}}"""
+        return try {
+            activity.contentResolver.persistedUriPermissions.any {
+                it.uri == uri && it.isReadPermission
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /** Re-attach to a folder the page remembered, after a restart. */
@@ -108,32 +128,23 @@ class WorkspaceBridge(private val activity: MainActivity) {
         return try {
             val uri = Uri.parse(uriString)
 
-            // Re-assert the persisted grant.
+            // Re-take the grant, then check it is genuinely held.
             //
-            // Android keeps a persistable grant across restarts, but the
-            // process must hold it before DocumentFile can read through the
-            // tree URI. Re-taking is idempotent when the grant already exists,
-            // and it is what makes a restored folder usable rather than merely
-            // remembered.
-            try {
-                activity.contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                )
-            } catch (e: SecurityException) {
-                // Already held, or the provider does not offer persistable
-                // grants. Not fatal on its own; the canRead check below decides.
-            }
+            // Re-taking is idempotent when the grant exists. If it does not
+            // persist, the folder stays readable only while this process lives,
+            // and saying so is better than reporting success and failing later
+            // with nothing to explain it.
+            val durable = takePersistentGrant(uri)
 
             val doc = DocumentFile.fromTreeUri(activity, uri)
             if (doc == null) {
-                return """{"ok":false,"error":"The folder could not be opened."}"""
+                return jsonError("The folder could not be opened.")
             }
             if (!doc.canRead()) {
-                return """{"ok":false,"error":"The folder is no longer readable."}"""
+                return jsonError("The folder is no longer readable. Link it again to restore access.")
             }
             folders[id] = uri
-            """{"ok":true,"id":"$id","name":${jsonString(doc.name ?: "Folder")}}"""
+            """{"ok":true,"id":"$id","name":${jsonString(doc.name ?: "Folder")},"durable":$durable}"""
         } catch (e: Exception) {
             jsonError("Could not restore the folder: ${e.message}")
         }
