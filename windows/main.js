@@ -254,6 +254,7 @@ function createRemoteViews() {
 
 
 
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);
@@ -609,20 +610,59 @@ async function stopServer() {
 const INACTIVITY_TIMEOUT_MS = 120_000;
 
 /**
- * No tab switch is needed for the copy.
+ * Show the DeepSeek view for the duration of the copy, with the client UI over it.
  *
- * This used to show the DeepSeek view for the duration, copying the Android
- * reasoning without checking whether Windows shared the constraint. It does not:
- * a parked WebContentsView keeps a real size - measured at 1304x788 while parked,
- * reporting itself visible - so the page renders regardless of what is on screen.
- * And sendInputEvent delivers to the WebContents directly rather than through the
- * window, so the click lands either way.
+ * Chromium only renders a view it considers visible, and the site's transcript is
+ * a virtualised list - so a view that is not visible renders no rows and there is
+ * nothing to copy. Android solves this by keeping the hidden tab INVISIBLE rather
+ * than GONE; here the equivalent is to give the view real bounds and put the Web UI
+ * on top, so the page is genuinely on screen while the user keeps looking at the
+ * client.
  *
- * Kept rather than inlined so callers keep their shape, and so the reason there is
- * nothing to restore is on record.
+ * The z-order is the whole trick: both views occupy the same rectangle, and the
+ * one added last sits on top. The client UI is raised for the duration and the
+ * DeepSeek view raised again afterwards.
+ *
+ * Returns a function that restores the previous arrangement, so the restore runs
+ * even if the copy throws.
  */
 function parkOtherViewsForCopy() {
-  return () => {};
+  const previous = activeView;
+
+  if (!deepseekView || !webUiView || !lastBounds) {
+    // Nothing laid out yet; the copy will fall back to the captured buffer.
+    return () => {};
+  }
+
+  try {
+    // Both views get the same real rectangle.
+    deepseekView.setBounds(lastBounds);
+    webUiView.setBounds(lastBounds);
+
+    // The client UI on top, so the DeepSeek page renders underneath unseen.
+    if (previous === "webui") {
+      mainWindow.contentView.addChildView(webUiView);
+      mainWindow.contentView.addChildView(deepseekView);
+      mainWindow.contentView.addChildView(webUiView);
+    } else {
+      // The user is on another tab: put the client UI over the DeepSeek view so
+      // the screen does not change, then restore the tab they were on.
+      mainWindow.contentView.addChildView(deepseekView);
+      mainWindow.contentView.addChildView(webUiView);
+    }
+  } catch (e) {
+    log(`Could not overlay the views for the copy: ${e.message}`);
+    return () => {};
+  }
+
+  return () => {
+    try {
+      // Hand the layout back to the tab the user was on.
+      setActiveView(previous);
+    } catch (e) {
+      /* the window may be closing */
+    }
+  };
 }
 
 /**
