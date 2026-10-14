@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<!--
+  The two remote pages are hosted in WebContentsViews owned by the main
+  process, not in this document, so this policy can stay restrictive and still
+  let them load. Images and fonts come from the local bundle only.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+<title>DeepSeek Standalone</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="tabs">
+    <button class="tab active" data-view="deepseek">DeepSeek</button>
+    <button class="tab" data-view="webui">Web UI</button>
+    <button class="tab" data-view="controls">Controls</button>
+  </header>
+
+  <!-- Remote pages are attached here as WebContentsViews by the main process. -->
+  <main class="stage">
+    <div class="host" id="host-deepseek"></div>
+    <div class="host hidden" id="host-webui"></div>
+
+    <section class="controls" id="view-controls">
+      <h1>Standalone bridge</h1>
+      <p class="muted">
+        No Cloudflare Worker. The API is served by this app and the Web UI talks
+        to it on loopback.
+      </p>
+
+      <div class="row">
+        <div class="grow">
+          <div class="label">Enable local API</div>
+          <code id="api-url">http://127.0.0.1:8080</code>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="api-toggle" checked />
+          <span></span>
+        </label>
+      </div>
+
+      <div class="grid">
+        <div class="k">Server</div><div class="v" id="st-server">stopped</div>
+        <div class="k">Transport</div><div class="v" id="st-transport">direct (local only)</div>
+        <div class="k">Last error</div><div class="v" id="st-error">none</div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-restart" class="primary">Restart API</button>
+        <button id="btn-reload">Reload DeepSeek</button>
+      </div>
+
+      <div class="row loghead">
+        <div class="label">Log (<span id="log-count">0</span>)</div>
+        <button id="btn-clear" class="link">Clear</button>
+      </div>
+      <pre class="log" id="log"></pre>
+
+      <p class="muted small">
+        DeepSeek and Web UI are separate tabs; switch with the buttons above.
+      </p>
+    </section>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+{
+  "name": "deepseek-standalone-win",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Portable DeepSeek Code client for Windows. No Cloudflare Worker.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win dir"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.deepseek.standalone.win",
+    "productName": "DeepSeek Code",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "api.js",
+      "config.js",
+      "hook.js",
+      "preload.js",
+      "preload-ui.js",
+      "preload-renderer.js",
+      "renderer/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "compression": "maximum"
+  }
+}
