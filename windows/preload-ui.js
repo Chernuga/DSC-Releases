@@ -1,10 +1,22 @@
 // Preload for the client UI page.
 //
-// Exposes the same bridge the Android app provides - AndroidWorkspace and
-// AndroidLocalProvider - so the website needs no knowledge of which platform it
-// is running on.
+// Two jobs: seed the provider list before the page reads it, and expose the same
+// bridge the Android app provides.
 //
-// SYNCHRONOUS ON PURPOSE.
+// SEEDING HAS TO HAPPEN HERE.
+//
+// The main process tried this with executeJavaScript on did-start-loading and
+// dom-ready. Both are too late: the page runs `let settings = loadSettings()` as
+// its script executes, so it had already read the old storage. The result was
+// storage saying "local-standalone" while the running page used "deepseek-web"
+// with an empty base URL - configured on paper, unconfigured in fact, which is
+// what a fresh download saw.
+//
+// A preload runs before the document's scripts on every load, which is the one
+// place early enough. localStorage is shared with the page, so writing it here is
+// the same storage the page reads a moment later.
+//
+// THE BRIDGE IS SYNCHRONOUS ON PURPOSE.
 //
 // Android's @JavascriptInterface methods return a value directly, so the page
 // calls them without awaiting:
@@ -16,14 +28,49 @@
 // picker itself had worked. ipcRenderer.sendSync blocks for the real value, so
 // these methods behave exactly like Android's and the page runs unchanged.
 //
-// The work is all local filesystem access that completes in milliseconds; the one
-// genuinely slow call - the folder picker - blocks only while the user is choosing,
-// which is inherent to a modal dialog.
-//
 // contextIsolation stays ON: the page gets the methods listed here and nothing
 // else. No Node, no ipcRenderer, no filesystem beyond the linked folder.
 
 const { contextBridge, ipcRenderer } = require("electron");
+
+// -- Seed the provider list before the page's script runs ----------------------
+
+try {
+  // The record is built in the main process, which owns the port, so the two
+  // cannot disagree about where the API lives.
+  const provider = ipcRenderer.sendSync("workspace:localProvider");
+  if (provider) {
+    const KEY = "deepseek-ui-settings";
+    let s = {};
+    try {
+      s = JSON.parse(localStorage.getItem(KEY) || "{}");
+    } catch (e) {
+      s = {};
+    }
+
+    // Whether this profile has ever held a provider list.
+    const firstRun = !Array.isArray(s.providers) || !s.providers.length;
+
+    if (!Array.isArray(s.providers)) s.providers = [];
+    const at = s.providers.findIndex((p) => p && p.id === provider.id);
+    if (at >= 0) s.providers[at] = provider;
+    else s.providers.push(provider);
+
+    // Select it on a first run, and whenever the choice is missing or still the
+    // website's own default.
+    const unset = !s.activeProviderId || s.activeProviderId === "deepseek-web";
+    if (firstRun || unset) s.activeProviderId = provider.id;
+
+    if (!Array.isArray(s.models) || !s.models.length) s.models = provider.models;
+    s.model = s.model || "deepseek-web";
+
+    localStorage.setItem(KEY, JSON.stringify(s));
+  }
+} catch (e) {
+  // A storage failure must not stop the page from loading.
+}
+
+// -- The workspace bridge -------------------------------------------------------
 
 /** Call the main process and return its result as Android would: directly. */
 const call = (channel, ...args) => ipcRenderer.sendSync(channel, ...args);
@@ -60,5 +107,5 @@ contextBridge.exposeInMainWorld("AndroidWorkspace", {
 
 // The page checks for this before showing the fetch-last button, and uses it to
 // decide that a real page is being driven. It has no methods of its own; the
-// provider record it would seed is written directly by the main process.
+// provider record it would seed is written above.
 contextBridge.exposeInMainWorld("AndroidLocalProvider", {});

@@ -243,57 +243,28 @@ function createRemoteViews() {
   mainWindow.contentView.addChildView(webUiView);
 
   // Seed the site's own provider list so the client UI points here, without
-  // modifying the website. Runs before the page's script reads its settings.
-  webUiView.webContents.on("did-finish-load", () => {
+  // modifying the website.
+  //
+  // This must run BEFORE the page's script reads its settings. It used to run on
+  // did-finish-load, which is after that point - the write landed in localStorage
+  // but the running page had already read its config, so the provider only showed
+  // up once something else caused a reload. On a fresh install that meant it was
+  // not there at all until the user opened Settings.
+  //
+  // did-start-loading fires before any page script runs; dom-ready repeats it in
+  // case the first attempt was too early for localStorage to exist.
+  const seed = () => {
     webUiView?.webContents
       .executeJavaScript(seedLocalProviderScript(), true)
       .then((r) => log(`Web UI provider seed: ${r}`))
       .catch(() => {});
-  });
+  };
+  webUiView.webContents.on("did-start-loading", seed);
+  webUiView.webContents.on("dom-ready", seed);
   webUiView.webContents.loadURL(WEB_UI_URL);
 
-  // TEMPORARY: measure the settings layout.
-  setTimeout(async () => {
-    try {
-      const r = await webUiView.webContents.executeJavaScript(
-        [
-          "(function(){",
-          "  var shell = document.querySelector('.settings-shell');",
-          "  if (shell) shell.classList.add('open');",
-          "  document.querySelectorAll('.settings-panel').forEach(function(p){",
-          "    p.classList.toggle('active', p.dataset.section === 'chat');",
-          "  });",
-          "  var body = document.querySelector('.settings-body');",
-          "  var win = document.querySelector('.settings-window');",
-          "  var out = {",
-          "    winW: win ? win.clientWidth : null,",
-          "    bodyScrollW: body ? body.scrollWidth : null,",
-          "    bodyClientW: body ? body.clientWidth : null,",
-          "    overflows: body ? body.scrollWidth > body.clientWidth + 1 : null,",
-          "    toggles: []",
-          "  };",
-          "  ['sCustomInstructionsEnabled','sPromptFinishEnabled'].forEach(function(id){",
-          "    var el = document.getElementById(id);",
-          "    if (!el) { out.toggles.push({id:id, missing:true}); return; }",
-          "    var row = el.closest('.setting-switch');",
-          "    var rect = row ? row.getBoundingClientRect() : null;",
-          "    out.toggles.push({",
-          "      id: id,",
-          "      left: rect ? Math.round(rect.left) : null,",
-          "      right: rect ? Math.round(rect.right) : null,",
-          "      onScreen: rect ? (rect.right <= window.innerWidth && rect.left >= 0) : false",
-          "    });",
-          "  });",
-          "  return JSON.stringify(out);",
-          "})()",
-        ].join("\n"),
-        true
-      );
-      log(`MEASURE ${r}`);
-    } catch (e) {
-      log(`MEASURE failed: ${e.message}`);
-    }
-  }, 12000);
+
+
 
 
 
@@ -315,7 +286,23 @@ function createRemoteViews() {
  * indistinguishable from configuring it by hand - no change to the website.
  */
 function seedLocalProviderScript() {
-  const provider = {
+  // Superseded: the preload writes the provider before the page reads it.
+  //
+  // Seeding from here ran on did-start-loading and dom-ready, both of which are
+  // after the page executes `let settings = loadSettings()`. The write landed in
+  // storage but the running page never read it, so the app looked configured while
+  // using a provider with no base URL.
+  return "delegated to preload-ui.js";
+}
+
+/**
+ * The provider record the client UI should use for this machine.
+ *
+ * Built in one place so the port cannot drift between what is advertised and
+ * where the API actually listens.
+ */
+function localProvider() {
+  return {
     id: "local-standalone",
     label: "This PC (standalone)",
     baseUrl: `http://${API_HOST}:${API_PORT}`,
@@ -327,31 +314,13 @@ function seedLocalProviderScript() {
     note: "Served by the desktop app. No Worker, no network hop.",
     models: [
       { id: "deepseek-web", label: "DeepSeek (Web)", desc: "Current web model" },
-      { id: "deepseek-web-think", label: "DeepSeek (DeepThink)", desc: "Reasoning" },
+      { id: "deepseek-web-think", label: "DeepSeek (Think)", desc: "Reasoning" },
     ],
   };
-
-  return `
-    (function(){
-      try {
-        var KEY = 'deepseek-ui-settings';
-        var p = ${JSON.stringify(provider)};
-        var s = {};
-        try { s = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { s = {}; }
-        if (!Array.isArray(s.providers)) s.providers = [];
-        var i = -1;
-        for (var k = 0; k < s.providers.length; k++) {
-          if (s.providers[k] && s.providers[k].id === p.id) { i = k; break; }
-        }
-        if (i >= 0) s.providers[i] = p; else s.providers.push(p);
-        if (!s.activeProviderId || s.activeProviderId === 'deepseek-web') s.activeProviderId = p.id;
-        if (!s.model) s.model = 'deepseek-web';
-        localStorage.setItem(KEY, JSON.stringify(s));
-        return 'seeded';
-      } catch (e) { return 'seed error: ' + e; }
-    })();
-  `;
 }
+
+/** Serve the record to the preload, which writes it before the page reads it. */
+onSync("workspace:localProvider", () => localProvider());
 
 /**
  * Show one remote view and park the other off screen.
