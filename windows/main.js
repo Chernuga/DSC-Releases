@@ -252,6 +252,49 @@ function createRemoteViews() {
   });
   webUiView.webContents.loadURL(WEB_UI_URL);
 
+  // TEMPORARY: measure the settings layout.
+  setTimeout(async () => {
+    try {
+      const r = await webUiView.webContents.executeJavaScript(
+        [
+          "(function(){",
+          "  var shell = document.querySelector('.settings-shell');",
+          "  if (shell) shell.classList.add('open');",
+          "  document.querySelectorAll('.settings-panel').forEach(function(p){",
+          "    p.classList.toggle('active', p.dataset.section === 'chat');",
+          "  });",
+          "  var body = document.querySelector('.settings-body');",
+          "  var win = document.querySelector('.settings-window');",
+          "  var out = {",
+          "    winW: win ? win.clientWidth : null,",
+          "    bodyScrollW: body ? body.scrollWidth : null,",
+          "    bodyClientW: body ? body.clientWidth : null,",
+          "    overflows: body ? body.scrollWidth > body.clientWidth + 1 : null,",
+          "    toggles: []",
+          "  };",
+          "  ['sCustomInstructionsEnabled','sPromptFinishEnabled'].forEach(function(id){",
+          "    var el = document.getElementById(id);",
+          "    if (!el) { out.toggles.push({id:id, missing:true}); return; }",
+          "    var row = el.closest('.setting-switch');",
+          "    var rect = row ? row.getBoundingClientRect() : null;",
+          "    out.toggles.push({",
+          "      id: id,",
+          "      left: rect ? Math.round(rect.left) : null,",
+          "      right: rect ? Math.round(rect.right) : null,",
+          "      onScreen: rect ? (rect.right <= window.innerWidth && rect.left >= 0) : false",
+          "    });",
+          "  });",
+          "  return JSON.stringify(out);",
+          "})()",
+        ].join("\n"),
+        true
+      );
+      log(`MEASURE ${r}`);
+    } catch (e) {
+      log(`MEASURE failed: ${e.message}`);
+    }
+  }, 12000);
+
 
 
 
@@ -486,15 +529,57 @@ onSync("workspace:writeFile", (id, relativePath, base64) => {
   if (!root) return jErr("No folder is linked.");
   const full = safeJoin(root, relativePath);
   if (!full) return jErr("That path is outside the linked folder.");
+  const buf = Buffer.from(String(base64 || ""), "base64");
   try {
     fs.mkdirSync(path.dirname(full), { recursive: true });
-    const buf = Buffer.from(String(base64 || ""), "base64");
     fs.writeFileSync(full, buf);
     return j({ ok: true, path: relativePath, size: buf.length });
   } catch (e) {
-    return jErr(`Could not write ${relativePath}: ${e.message}`);
+    // A read-only attribute is the common cause on Windows, and it is easy to
+    // clear, so do that rather than reporting a failure the user cannot act on.
+    // Writing to a file marked read-only is permitted once the flag is removed -
+    // the attribute is a convention, not a permission.
+    if (e.code === "EPERM" || e.code === "EACCES") {
+      try {
+        fs.chmodSync(full, 0o666);
+        fs.writeFileSync(full, buf);
+        return j({ ok: true, path: relativePath, size: buf.length, clearedReadOnly: true });
+      } catch (e2) {
+        return jErr(explainWriteFailure(relativePath, full, e2));
+      }
+    }
+    return jErr(explainWriteFailure(relativePath, full, e));
   }
 });
+
+/**
+ * Turn a write failure into something that says what to do about it.
+ *
+ * "EPERM: operation not permitted" names neither the file's state nor a remedy,
+ * and the reported case - a file with the read-only attribute - looked like a
+ * fault in the app.
+ */
+function explainWriteFailure(relativePath, full, e) {
+  const code = e.code || "";
+  if (code === "EPERM" || code === "EACCES") {
+    let locked = "";
+    try {
+      // Present but unwritable after clearing the flag means something else holds
+      // it - an editor, a sync client, or a scanner.
+      if (fs.existsSync(full)) {
+        const st = fs.statSync(full);
+        locked = st.isFile() ? " The file may be open in another program." : "";
+      }
+    } catch (e2) {
+      /* the stat is only for the hint */
+    }
+    return (
+      `Could not write ${relativePath}: Windows refused the write even after ` +
+      `clearing the read-only attribute.${locked}`
+    );
+  }
+  return `Could not write ${relativePath}: ${e.message}`;
+}
 
 onSync("workspace:deleteFile", (id, relativePath) => {
   const root = linkedFolders.get(id);
