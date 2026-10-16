@@ -13,9 +13,13 @@
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!--
+    Web UI is marked active to match the starting view, so the first paint shows
+    the right tab instead of correcting itself a moment later.
+  -->
   <header class="tabs">
-    <button class="tab active" data-view="deepseek">DeepSeek</button>
-    <button class="tab" data-view="webui">Web UI</button>
+    <button class="tab" data-view="deepseek">DeepSeek</button>
+    <button class="tab active" data-view="webui">Web UI</button>
     <button class="tab" data-view="controls">Controls</button>
   </header>
 

@@ -271,6 +271,8 @@ function createRemoteViews() {
 
 
 
+
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);
@@ -330,7 +332,14 @@ onSync("workspace:localProvider", () => localProvider());
  */
 let lastBounds = null;
 
-let activeView = "deepseek";
+/**
+ * Which view is on screen.
+ *
+ * Opens on the client UI, matching Android, whose pager starts at page 1. The
+ * DeepSeek tab is where the session lives and where you sign in, but it is not
+ * what the app is for - the client UI is.
+ */
+let activeView = "webui";
 const PARKED = { x: -20000, y: 0, width: 800, height: 600 };
 
 function setActiveView(name) {

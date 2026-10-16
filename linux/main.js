@@ -289,6 +289,7 @@ function createRemoteViews() {
 
 
 
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);

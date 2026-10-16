@@ -110,5 +110,11 @@ api.getUrls().then((u) => {
   void u;
 });
 
-// The window can be resized before the first layout settles.
-setTimeout(() => showView("deepseek"), 60);
+// Re-assert the view once the first layout has settled.
+//
+// The window can be resized before that, which leaves the native rectangles
+// misaligned with their placeholders. This used to hard-code "deepseek", so it
+// overrode the starting view 60ms after load and the app always opened on the
+// DeepSeek tab no matter what currentView said. It now re-asserts whatever view
+// is current, which is the client UI.
+setTimeout(() => showView(currentView), 60);
