@@ -273,6 +273,7 @@ function createRemoteViews() {
 
 
 
+
   for (const v of [deepseekView, webUiView]) {
     v.webContents.setWindowOpenHandler(({ url }) => {
       shell.openExternal(url);
@@ -310,8 +311,14 @@ function localProvider() {
     baseUrl: `http://${API_HOST}:${API_PORT}`,
     apiKey: "local",
     route: "coding",
-    pathSuffix: "/chat/completions/full",
-    responseMode: "full",
+    // Stream by default.
+    //
+    // This said "/chat/completions/full" with responseMode "full", which collects
+    // the whole answer before answering - so the client showed nothing until the
+    // model finished, waited as if more were coming, then rendered everything at
+    // once. The bridge streams fine; the request was simply asking it not to.
+    pathSuffix: "/chat/completions",
+    responseMode: "stream",
     modelsPath: "/models",
     note: "Served by the desktop app. No Worker, no network hop.",
     models: [
