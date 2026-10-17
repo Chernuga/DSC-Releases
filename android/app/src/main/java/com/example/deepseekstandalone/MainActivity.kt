@@ -730,6 +730,16 @@ class MainActivity : ComponentActivity(), ServerHandler {
         // with the page-level toggles left alone.
         sendPrompt(prompt, thinking = false, search = false, onChunk = onChunk)
 
+    override suspend fun currentChatUrl(): String =
+        webViewBridge?.currentUrl() ?: ""
+
+    override suspend fun openChat(url: String): Boolean =
+        webViewBridge?.navigateToChat(url) ?: false
+
+    // Android reads the DeepThink / Search flags from the page's own requests
+    // rather than clicking its controls, so there is no page toggle to mirror.
+    override suspend fun applyToggles(thinking: Boolean, search: Boolean): Boolean = false
+
     override suspend fun sendPrompt(
         prompt: String,
         thinking: Boolean,

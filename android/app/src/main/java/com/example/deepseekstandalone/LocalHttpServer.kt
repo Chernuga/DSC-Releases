@@ -29,6 +29,12 @@ interface ServerHandler {
     fun getTunnelStatus(): String = "local"
     fun getLastError(): String?
     fun getErrorLog(): List<String>
+    /** The conversation the page is showing, for a client's own bookkeeping. */
+    suspend fun currentChatUrl(): String = ""
+    /** Move the page to a conversation and answer whether it settled. */
+    suspend fun openChat(url: String): Boolean = false
+    /** Mirror the client's DeepThink / Search switches onto the page. */
+    suspend fun applyToggles(thinking: Boolean, search: Boolean): Boolean = false
     suspend fun sendPrompt(prompt: String, onChunk: (String) -> Unit): Result<Unit>
     /** Same, with the page-level DeepThink / web-search options applied first. */
     suspend fun sendPrompt(
@@ -154,6 +160,8 @@ class LocalHttpServer(
             (uri == "/coding/chat/completions/full" || uri == "/general/chat/completions/full") &&
                 method == Method.POST -> handleChatFull(session, openAiShape = true)
             uri == "/status" && method == Method.GET -> handleStatus()
+            uri == "/open" && method == Method.POST -> handleOpen(session)
+            uri == "/toggles" && method == Method.POST -> handleToggles(session)
             // Recover the last reply the page already produced.
             //
             // For when a request failed but the answer exists on the page - a
@@ -1431,8 +1439,73 @@ class LocalHttpServer(
             put("api_enabled", handler.isApiEnabled())
             put("tunnel", handler.getTunnelStatus())
             put("last_error", handler.getLastError() ?: JSONObject.NULL)
+            // The conversation the page is showing. A client polls this to
+            // remember which chat each of its own conversations belongs to,
+            // including when the user navigates the DeepSeek tab by hand.
+            put("chat_url", runBlocking { handler.currentChatUrl() })
         }
         return jsonResponse(Response.Status.OK, json)
+    }
+
+    /**
+     * Move the page to a named conversation, and answer once it is ready.
+     *
+     * Used when the client switches conversations rather than when it sends, so
+     * the navigation happens once and can be awaited. A failure is reported rather
+     * than hidden, because a prompt typed mid-navigation lands in the wrong chat.
+     */
+    private fun handleOpen(session: IHTTPSession): Response {
+        val bodyMap = HashMap<String, String>()
+        try {
+            session.parseBody(bodyMap)
+        } catch (e: Exception) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", JSONObject().put("message", "Failed to parse body: ${e.message}"))
+            )
+        }
+        val jsonReq = try { JSONObject(bodyMap["postData"] ?: "") } catch (e: Exception) { JSONObject() }
+        val url = jsonReq.optString("url", "")
+        if (!url.startsWith("https://chat.deepseek.com/")) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", JSONObject().put("message", "Only DeepSeek chat URLs can be opened."))
+            )
+        }
+        val ok = runBlocking { handler.openChat(url) }
+        return if (ok) {
+            jsonResponse(Response.Status.OK, JSONObject().apply {
+                put("ok", true)
+                put("chat_url", url)
+            })
+        } else {
+            // 504 Gateway Timeout is not in NanoHTTPD's Status enum.
+            jsonResponse(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().apply {
+                    put("ok", false)
+                    put("error", JSONObject().put("message", "The page did not finish loading that conversation."))
+                }
+            )
+        }
+    }
+
+    /** Mirror the client's DeepThink / Search switches onto the page. */
+    private fun handleToggles(session: IHTTPSession): Response {
+        val bodyMap = HashMap<String, String>()
+        try {
+            session.parseBody(bodyMap)
+        } catch (e: Exception) {
+            return jsonResponse(
+                Response.Status.BAD_REQUEST,
+                JSONObject().put("error", JSONObject().put("message", "Failed to parse body: ${e.message}"))
+            )
+        }
+        val jsonReq = try { JSONObject(bodyMap["postData"] ?: "") } catch (e: Exception) { JSONObject() }
+        val ok = runBlocking {
+            handler.applyToggles(jsonReq.optBoolean("thinking", false), jsonReq.optBoolean("search", false))
+        }
+        return jsonResponse(Response.Status.OK, JSONObject().put("ok", ok))
     }
 
     private fun handleErrors(): Response {

@@ -149,11 +149,63 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
 
     try {
       if (route === "/status" && req.method === "GET") {
+        // chat_url is where the page is showing right now. A client uses it to
+        // remember which conversation each of its own conversations belongs to,
+        // including when the user navigates the page by hand.
+        let chatUrl = "";
+        try {
+          chatUrl = await h.currentChatUrl();
+        } catch (e) {
+          chatUrl = "";
+        }
         return json(res, 200, {
           api_enabled: h.isEnabled(),
           tunnel: "local",
           transport: "direct (loopback)",
+          chat_url: chatUrl,
         });
+      }
+
+      // Move the page to a named conversation, and answer once it is ready to be
+      // typed into.
+      //
+      // Separate from a chat request so switching conversations can happen when
+      // the client switches, not only when it sends. Awaiting it is what stops a
+      // prompt being typed into the previous chat while the page is still moving.
+      if (route === "/open" && req.method === "POST") {
+        let url = "";
+        try {
+          url = String(JSON.parse((await readBody(req)) || "{}").url || "");
+        } catch (e) {
+          return json(res, 400, { error: { message: "Body must be JSON with a url." } });
+        }
+        if (!/^https:\/\/chat\.deepseek\.com\//.test(url)) {
+          return json(res, 400, { error: { message: "Only DeepSeek chat URLs can be opened." } });
+        }
+        let ok = false;
+        try {
+          ok = await h.openChat(url);
+        } catch (err) {
+          return json(res, 502, { ok: false, error: { message: err.message } });
+        }
+        // ok:false means the page did not settle, so the caller knows the switch
+        // failed rather than assuming it worked.
+        return json(res, ok ? 200 : 504, ok
+          ? { ok: true, chat_url: url }
+          : { ok: false, error: { message: "The page did not finish loading that conversation." } });
+      }
+
+      // Mirror the client's toggles onto the page as they are flipped, so the
+      // DeepSeek tab shows the same state rather than only matching at send time.
+      if (route === "/toggles" && req.method === "POST") {
+        let body = {};
+        try {
+          body = JSON.parse((await readBody(req)) || "{}");
+        } catch (e) {
+          return json(res, 400, { error: { message: "Body must be JSON." } });
+        }
+        const ok = await h.applyToggles(Boolean(body.thinking), Boolean(body.search));
+        return json(res, 200, { ok });
       }
 
       if (route === "/errors" && req.method === "GET") {

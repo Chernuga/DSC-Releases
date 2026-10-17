@@ -1047,6 +1047,58 @@ const handlers = {
     }
   },
 
+  /**
+   * Move the page to a conversation, and answer whether it settled.
+   *
+   * Used when the client switches conversations rather than when it sends, so the
+   * navigation happens once instead of being folded into the next request. Returns
+   * false when the page did not become ready, which the caller reports rather than
+   * treating as success.
+   */
+  async openChat(url) {
+    if (!deepseekView || deepseekView.webContents.isDestroyed()) return false;
+    try {
+      await ensurePageUrl(url);
+      return true;
+    } catch (e) {
+      log(`Could not open ${url}: ${e.message}`);
+      return false;
+    }
+  },
+
+  /**
+   * Mirror the client's DeepThink / Search switches onto the page.
+   *
+   * Called when a switch is flipped, so the DeepSeek tab shows the same state.
+   * Sending also applies them, so this is presentation rather than correctness -
+   * but a switch that appears to do nothing is confusing.
+   */
+  async applyToggles(thinking, search) {
+    if (!deepseekView || deepseekView.webContents.isDestroyed()) return false;
+    try {
+      await deepseekView.webContents.executeJavaScript(
+        `window.__dsPage && window.__dsPage.applyToggles(${Boolean(thinking)}, ${Boolean(search)})`,
+        true
+      );
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+
+  /**
+   * The conversation the page is showing right now.
+   *
+   * A client polls this to remember which chat each of its own conversations was
+   * looking at - including when the user navigates the DeepSeek tab by hand. It
+   * reports the live URL rather than anything cached, so the answer cannot lag
+   * behind a navigation.
+   */
+  async currentChatUrl() {
+    if (!deepseekView || deepseekView.webContents.isDestroyed()) return "";
+    return deepseekView.webContents.getURL();
+  },
+
   /** Whether the page is offering its Continue control. */
   async isContinueOffered() {
     if (!deepseekView || deepseekView.webContents.isDestroyed()) return false;

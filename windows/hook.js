@@ -263,14 +263,22 @@
     return /disabled/i.test(cls);
   }
 
+  /**
+   * Set a page toggle to a wanted state.
+   *
+   * This used to only ever turn a control on, so a toggle left on in the page
+   * could not be turned off from the client - the request said "off" but the page
+   * still searched. It now compares the wanted state with the control's own and
+   * clicks only when they differ.
+   */
   function pressToggle(want, words) {
-    if (!want) return;
+    const wanted = Boolean(want);
     for (const el of document.querySelectorAll('div[role="button"], button')) {
       const label = (el.innerText || "").trim().toLowerCase();
       if (!label || !words.some((w) => label.includes(w))) continue;
       const cls = typeof el.className === "string" ? el.className : "";
       const on = cls.includes("active") || el.getAttribute("aria-pressed") === "true";
-      if (!on) el.click();
+      if (on !== wanted) el.click();
       return;
     }
   }
@@ -282,6 +290,18 @@
         loggedIn: !/\/sign_in|\/login/i.test(location.pathname),
         hasInput: Boolean(findInput()),
       };
+    },
+
+    /**
+     * Set the page's DeepThink and Search controls to match the client.
+     *
+     * Exposed so flipping a toggle in the client is visible on the DeepSeek tab
+     * straight away, rather than only taking effect at the next send.
+     */
+    applyToggles(thinking, search) {
+      pressToggle(thinking, ["deepthink", "think"]);
+      pressToggle(search, ["search"]);
+      return { ok: true };
     },
 
     async sendPrompt(prompt, thinking, search, chan) {
