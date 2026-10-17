@@ -370,12 +370,42 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
           res.write(`data: ${JSON.stringify(frame)}\n\n`);
         };
 
+        /**
+         * Send text split into pieces small enough for a client to animate.
+         *
+         * The page batches: one patch can carry several paragraphs. Forwarding
+         * that as a single delta leaves nothing between the start and the end for
+         * the client to reveal, so the answer appears all at once however smooth
+         * its animation is.
+         */
+        const writeInChunks = (kind, text) => {
+          const CHUNK = 60;
+          if (text.length <= CHUNK) {
+            write(kind, text);
+            return;
+          }
+          let at = 0;
+          while (at < text.length) {
+            let end = Math.min(at + CHUNK, text.length);
+            // Prefer a word boundary so a chunk does not end mid-word.
+            if (end < text.length) {
+              const space = text.lastIndexOf(" ", end);
+              if (space > at + CHUNK / 2) end = space + 1;
+            }
+            write(kind, text.slice(at, end));
+            at = end;
+          }
+        };
+
         try {
           const final = await h.complete({
             prompt, thinking, search, chatUrl, signal: controller.signal,
             onDelta: (d) => {
-              if (d.reasoning) write("reasoning_content", d.reasoning);
-              if (d.content) write("content", d.content);
+              // Split before sending: the page batches its text, so one delta can
+              // carry several paragraphs, and a wall of text arriving at once
+              // cannot be revealed smoothly however fast the client draws it.
+              if (d.reasoning) writeInChunks("reasoning_content", d.reasoning);
+              if (d.content) writeInChunks("content", d.content);
             },
           });
           // Tell a client that started from the home page which chat the page

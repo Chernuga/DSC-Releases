@@ -705,7 +705,7 @@ class LocalHttpServer(
             var parsedOk = 0
             val parseSamples = ArrayList<String>()
 
-            fun emit(kind: String, value: String) {
+            fun emitOne(kind: String, value: String) {
                 val obj = JSONObject().apply {
                     put("id", chunkId)
                     put("object", "chat.completion.chunk")
@@ -721,6 +721,32 @@ class LocalHttpServer(
                 }
                 pipe.write("data: $obj\n\n".toByteArray(Charsets.UTF_8))
                 emittedAny = true
+            }
+
+            /**
+             * Send text to the client, split into pieces small enough to animate.
+             *
+             * The page batches its text, so one patch can carry several paragraphs.
+             * Passing that through as a single delta gave the client a wall of text
+             * at once, which cannot be revealed smoothly however fast it draws -
+             * there is nothing between the start and the end to animate through.
+             */
+            fun emit(kind: String, value: String) {
+                if (value.length <= EMIT_CHUNK_CHARS) {
+                    emitOne(kind, value)
+                    return
+                }
+                var at = 0
+                while (at < value.length) {
+                    var end = minOf(at + EMIT_CHUNK_CHARS, value.length)
+                    // Prefer a word boundary, so a chunk does not end mid-word.
+                    if (end < value.length) {
+                        val space = value.lastIndexOf(' ', end)
+                        if (space > at + EMIT_CHUNK_CHARS / 2) end = space + 1
+                    }
+                    emitOne(kind, value.substring(at, end))
+                    at = end
+                }
             }
 
             try {
@@ -1042,6 +1068,17 @@ class LocalHttpServer(
          * off, and a genuinely dead connection fails promptly.
          */
         const val INACTIVITY_TIMEOUT_MS = 120_000L
+
+        /**
+         * Largest delta sent to a client, in characters.
+         *
+         * The page batches its text, so one patch can carry several paragraphs.
+         * A whole paragraph arriving as a single delta cannot be revealed
+         * smoothly however fast the client draws it - there is nothing between
+         * the start and the end to animate through. Splitting here means the
+         * client always has intermediate steps.
+         */
+        const val EMIT_CHUNK_CHARS = 60
     }
 
     /** Reasoning fragments live under a `thinking` path. */
