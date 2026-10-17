@@ -811,6 +811,70 @@ async function copyLastReplyViaButton(wc) {
   }
 }
 
+/**
+ * Make sure the DeepSeek page is on the given URL, and ready to be typed into.
+ *
+ * A no-op when it is already there, which is the common case: the page is left on
+ * the conversation between requests rather than reloaded, so its transcript and
+ * session survive.
+ *
+ * Returns once the input exists, because typing into a page that is still loading
+ * lands the text in the old document and the prompt is lost.
+ */
+async function ensurePageUrl(chatUrl) {
+  const wc = deepseekView.webContents;
+  const wanted = splitUrl(chatUrl);
+  const current = splitUrl(wc.getURL());
+
+  const same =
+    current.origin === wanted.origin && current.path === wanted.path;
+
+  if (!same) {
+    log(`Moving the DeepSeek page to ${wanted.path}`);
+    await wc.loadURL(wanted.full);
+
+    // The hook installs on did-start-loading and dom-ready; give it the same
+    // moment the page needs to render its composer.
+    const ready = await waitForInput(wc, 15_000);
+    if (!ready) {
+      throw new Error(
+        "The DeepSeek page did not finish loading that conversation. " +
+          "Check that you are still signed in, then try again."
+      );
+    }
+    rememberChatUrl(wc.getURL());
+  }
+}
+
+/** Origin and path, with query and fragment dropped for comparison. */
+function splitUrl(raw) {
+  const s = String(raw || "");
+  try {
+    const u = new URL(s);
+    return { full: s, origin: u.origin, path: u.pathname };
+  } catch (e) {
+    return { full: s, origin: "", path: s };
+  }
+}
+
+/** Poll until the page has a composer to type into. */
+async function waitForInput(wc, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const ok = await wc.executeJavaScript(
+        "Boolean(window.__dsPage) && Boolean(document.querySelector('textarea, [contenteditable=\"true\"]'))",
+        true
+      );
+      if (ok) return true;
+    } catch (e) {
+      /* the document is mid-navigation */
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return false;
+}
+
 const handlers = {
   isEnabled: () => state.apiEnabled,
   log,
@@ -824,9 +888,19 @@ const handlers = {
    * so a watchdog is reset on every delta: a slow but live answer may run as long
    * as it needs, while a genuinely stalled one fails after the quiet window.
    */
-  async complete({ prompt, thinking, search, onDelta, signal }) {
+  async complete({ prompt, thinking, search, chatUrl, onDelta, signal }) {
     if (!deepseekView || deepseekView.webContents.isDestroyed()) {
       throw new Error("The DeepSeek page is not available.");
+    }
+
+    // Move the page to the conversation this request belongs to, before typing.
+    //
+    // The page IS the conversation: a prompt is typed into whatever chat it is
+    // showing. Without this every client conversation poured its messages into one
+    // DeepSeek chat. A new conversation sends the bare URL, which creates a fresh
+    // chat on the first request.
+    if (chatUrl) {
+      await ensurePageUrl(chatUrl);
     }
 
     let lastProgressAt = Date.now();
@@ -877,7 +951,14 @@ const handlers = {
             `Any text already received is kept; use the fetch button to pull the full reply.`
         );
       }
-      return { content: result.content || "", reasoning: result.reasoning || "" };
+      // Report where the page ended up. A conversation started from the home page
+      // gets its chat URL only once DeepSeek has created one on the first request,
+      // so the client cannot know it in advance.
+      return {
+        content: result.content || "",
+        reasoning: result.reasoning || "",
+        chatUrl: deepseekView.webContents.getURL(),
+      };
     } finally {
       clearInterval(watchdog);
       ipcMain.removeListener("page:delta", onChunk);

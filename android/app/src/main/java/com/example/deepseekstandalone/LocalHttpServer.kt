@@ -38,6 +38,21 @@ interface ServerHandler {
         onChunk: (String) -> Unit
     ): Result<Unit> = sendPrompt(prompt, onChunk)
     /**
+     * Send a prompt into a named conversation.
+     *
+     * The page IS the conversation: a prompt is typed into whatever chat it is
+     * showing. Without the URL every client conversation pours its messages into
+     * one chat, so the caller names the one it means. A blank URL leaves the page
+     * where it is, which is right for a client with no notion of chats.
+     */
+    suspend fun sendPrompt(
+        prompt: String,
+        thinking: Boolean,
+        search: Boolean,
+        chatUrl: String,
+        onChunk: (String) -> Unit
+    ): Result<Unit> = sendPrompt(prompt, thinking, search, onChunk)
+    /**
      * The rendered answer text from the page. Used as the response body when the
      * site's own stream does not surface its content patches to us.
      */
@@ -288,6 +303,15 @@ class LocalHttpServer(
                 messages.getJSONObject(messages.length() - 1).optString("content", "")
             } else ""
         }
+        // The conversation this belongs to, when the client names one.
+        val chatUrl = jsonReq.optString("chat_url", "")
+        // The page-level options, read the same way as the streaming route so the
+        // two behave identically.
+        val thinkingEnabled =
+            jsonReq.optJSONObject("thinking")?.optString("type")
+                ?.equals("enabled", ignoreCase = true) == true
+        val searchEnabled =
+            jsonReq.optJSONObject("search")?.optBoolean("enabled", false) == true
         if (prompt.isBlank()) {
             return jsonResponse(
                 Response.Status.BAD_REQUEST,
@@ -328,7 +352,7 @@ class LocalHttpServer(
                 // The send runs normally; a separate watchdog observes progress
                 // and cancels only when the stream has gone quiet.
                 val sendJob = launch {
-                    sendResult = handler.sendPrompt(prompt) { chunk ->
+                    sendResult = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled, chatUrl) { chunk ->
                         val (text, isReasoning) = extractDelta(chunk)
                         if (text.isEmpty()) return@sendPrompt
                         if (isReasoning) reasoning.append(text) else answer.append(text)
@@ -639,9 +663,21 @@ class LocalHttpServer(
         val thinkingEnabled = thinkingObj?.optString("type")?.equals("enabled", ignoreCase = true) == true
         val searchEnabled = jsonReq.optJSONObject("search")
             ?.optBoolean("enabled", false) == true
+        // Which DeepSeek chat this request belongs to. Blank means "leave the page
+        // where it is", which is what a client without conversations sends.
+        val chatUrl = jsonReq.optString("chat_url", "")
+        // A plain "prompt" is accepted as well as a messages array, matching the
+        // desktop API, so a client can send the simplest possible body.
+        val plainPrompt = jsonReq.optString("prompt", "").trim()
         val messages = jsonReq.optJSONArray("messages")
 
-        val (prompt, hasUser) = parseMessagesToPrompt(messages)
+        val parsed = if (plainPrompt.isNotEmpty()) {
+            Pair(plainPrompt, true)
+        } else {
+            parseMessagesToPrompt(messages)
+        }
+        val prompt = parsed.first
+        val hasUser = parsed.second
         if (!hasUser || prompt.isBlank()) {
             return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", JSONObject().put("message", "No user message found")))
         }
@@ -703,7 +739,7 @@ class LocalHttpServer(
                 val answerBefore = try { handler.readRenderedAnswer() } catch (e: Exception) { "" }
                 val reasoningBefore = try { handler.readRenderedReasoning() } catch (e: Exception) { "" }
 
-                var result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled) { chunk ->
+                var result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled, chatUrl) { chunk ->
                     rawSeen++
                     val (text, isReasoning) = extractDelta(chunk)
                     if (text.isNotEmpty()) {
@@ -773,7 +809,7 @@ class LocalHttpServer(
                     onErrorLogged("Verification overlay detected; reloading and retrying once")
                     val ready = try { handler.reloadAndWait() } catch (e: Exception) { false }
                     if (ready && !handler.isVerificationShowing()) {
-                        result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled) { chunk ->
+                        result = handler.sendPrompt(prompt, thinkingEnabled, searchEnabled, chatUrl) { chunk ->
                             val (text, isReasoning) = extractDelta(chunk)
                             if (text.isNotEmpty()) {
                                 if (isReasoning && thinkingEnabled) emit("reasoning_content", text)

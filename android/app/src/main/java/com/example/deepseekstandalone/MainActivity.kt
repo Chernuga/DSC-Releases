@@ -739,6 +739,31 @@ class MainActivity : ComponentActivity(), ServerHandler {
         webViewBridge?.sendPrompt(prompt, thinking, search, onChunk)
             ?: Result.failure(Exception("WebView not ready"))
 
+    /**
+     * Send a prompt into a named conversation.
+     *
+     * The page is the conversation, so it must be on the right chat before the
+     * prompt is typed. A blank URL leaves it where it is.
+     */
+    override suspend fun sendPrompt(
+        prompt: String,
+        thinking: Boolean,
+        search: Boolean,
+        chatUrl: String,
+        onChunk: (String) -> Unit
+    ): Result<Unit> {
+        val bridge = webViewBridge ?: return Result.failure(Exception("WebView not ready"))
+        if (chatUrl.isNotBlank()) {
+            val moved = bridge.navigateToChat(chatUrl)
+            if (!moved) {
+                return Result.failure(
+                    Exception("Could not open that DeepSeek conversation.")
+                )
+            }
+        }
+        return bridge.sendPrompt(prompt, thinking, search, onChunk)
+    }
+
     override suspend fun confirmDomFallback(reason: String): Boolean {
         val deferred = CompletableDeferred<Boolean>()
         withContext(Dispatchers.Main) {

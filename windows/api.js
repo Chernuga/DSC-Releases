@@ -106,6 +106,10 @@ function extractPrompt(jsonReq) {
     prompt: combined,
     thinking: /thinking|reason/i.test(String(jsonReq.thinking?.type ?? "")),
     search: Boolean(jsonReq.search ?? jsonReq.search_enabled),
+    // Which DeepSeek conversation this request belongs to. The page is the chat,
+    // so the client names the one it means. Absent means "leave the page where it
+    // is", which is right for any client that has no notion of conversations.
+    chatUrl: typeof jsonReq.chat_url === "string" ? jsonReq.chat_url : "",
     model: jsonReq.model,
   };
 }
@@ -220,7 +224,7 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
           return json(res, 400, { error: { message: `Invalid JSON: ${e.message}` } });
         }
 
-        const { prompt, thinking, search, model } = extractPrompt(body);
+        const { prompt, thinking, search, chatUrl, model } = extractPrompt(body);
         if (!prompt.trim()) {
           return json(res, 400, { error: { message: "Missing or empty prompt" } });
         }
@@ -232,14 +236,18 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
           // One JSON response: collect everything, emit once.
           let content = "";
           let reasoning = "";
+          // Declared outside the try so the conversation URL the page reported
+          // survives into the response.
+          let settled = null;
           try {
             const result = await h.complete({
-              prompt, thinking, search, signal: controller.signal,
+              prompt, thinking, search, chatUrl, signal: controller.signal,
               onDelta: (d) => {
                 if (d.reasoning) reasoning += d.reasoning;
                 if (d.content) content += d.content;
               },
             });
+            settled = result;
             content = result.content || content;
             reasoning = result.reasoning || reasoning;
           } catch (err) {
@@ -277,6 +285,10 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
             // The standard signal for a truncated reply, plus an explicit flag
             // so a client need not infer it from the finish reason alone.
             x_truncated: truncated,
+            // Which DeepSeek conversation the page ended up on. A client that
+            // started from the home page learns its chat's URL only after the
+            // first request, so it has to be told.
+            x_chat_url: (settled && settled.chatUrl) || "",
             choices: [
               {
                 index: 0,
@@ -307,13 +319,18 @@ function startApi({ host = "127.0.0.1", port, getHandlers, onLog }) {
         };
 
         try {
-          await h.complete({
-            prompt, thinking, search, signal: controller.signal,
+          const final = await h.complete({
+            prompt, thinking, search, chatUrl, signal: controller.signal,
             onDelta: (d) => {
               if (d.reasoning) write("reasoning_content", d.reasoning);
               if (d.content) write("content", d.content);
             },
           });
+          // Tell a client that started from the home page which chat the page
+          // ended up on, so it can send the next turn to the same one.
+          if (final && final.chatUrl) {
+            write("chat_url", final.chatUrl);
+          }
         } catch (err) {
           res.write(`data: ${JSON.stringify({ error: { message: err.message } })}\n\n`);
         }

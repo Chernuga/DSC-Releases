@@ -991,6 +991,36 @@ class WebViewBridge(
         ready
     }
 
+    /**
+     * Put the page on a given conversation, and wait until it can be typed into.
+     *
+     * The page IS the conversation: a prompt goes into whatever chat is showing.
+     * Without this, every client conversation typed into the same chat.
+     *
+     * A no-op when the page is already there, so an ordinary turn does not reload
+     * and lose its transcript. Returns true when the composer is ready.
+     */
+    suspend fun navigateToChat(url: String): Boolean = withContext(Dispatchers.Main) {
+        val target = url.substringBefore('?').substringBefore('#')
+        val current = webView.url.orEmpty().substringBefore('?').substringBefore('#')
+
+        if (current == target) return@withContext true
+
+        webView.loadUrl(url)
+
+        var ready = false
+        for (i in 1..15) {
+            kotlinx.coroutines.delay(500L)
+            val probe = evalJsAwait(
+                "(document.querySelector('textarea') || " +
+                    "document.querySelector('[contenteditable=\"true\"]')) ? 'true' : 'false'"
+            )
+            if (probe.contains("true")) { ready = true; break }
+        }
+        if (ready) ensureBridgeInjected()
+        ready
+    }
+
     /** Run JS on the WebView and await its result. */
     private suspend fun evalJsAwait(script: String): String =
         suspendCancellableCoroutine { cont ->
