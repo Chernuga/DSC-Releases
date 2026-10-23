@@ -1,0 +1,2 @@
+# Archives over 100 MB are rejected by GitHub, so they live on Releases.
+*.zip
