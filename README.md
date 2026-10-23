@@ -1,35 +1,73 @@
-# Downloads
+# DeepSeek Code
 
-Ready-to-use builds of **DeepSeek Code**, one folder per platform. Source lives in
-[DSC-Source](https://github.com/Chernuga/DSC-Source) — this repository holds files to
-download and run, nothing else.
+A client that drives a real DeepSeek web session and exposes it over an OpenAI-shaped HTTP
+API. One repository, three platforms, source and ready-to-run builds together.
 
-| Folder | Platform | What is here |
+## Download and run
+
+| Platform | Folder | File |
 |---|---|---|
-| [`windows/`](windows/) | Windows 10/11 x64 | Link to the release archive + checksum |
-| [`android/`](android/) | Android 7+ | The APK itself + checksum |
-| [`linux/`](linux/) | Linux x64 | Link to the release archive + checksum |
+| Windows 10/11 x64 | [`windows/`](windows/) | [DeepSeekCode-win-x64.zip](https://github.com/Chernuga/DSC-Releases/releases/download/win-v1.1/DeepSeekCode-win-x64.zip) |
+| Android 7+ | [`android/`](android/) | [`app-debug.apk`](android/app-debug.apk) (12.4 MB) |
+| Linux x64 | [`linux/`](linux/) | [DeepSeekCode-linux-x64.tar.gz](https://github.com/Chernuga/DSC-Releases/releases/download/linux-v1.1/DeepSeekCode-linux-x64.tar.gz) |
 
-The Windows archive is 151 MB, and GitHub rejects files over 100 MB, so it is attached to
-[Releases](../../releases) and each folder links to it. The APK fits, so it is stored here
-directly.
+The Windows and Linux archives are attached to [Releases](../../releases) — GitHub rejects
+files over 100 MB, so they cannot live in the tree. The APK is small enough to sit in its
+folder directly.
 
-## The simplest way
+Each folder's README covers installing and verifying that platform.
 
-Open **[Releases](../../releases)** and download the archive for your platform.
+## What it does
 
-- **Windows** — extract the zip; run `DeepSeek Code.exe` from inside the folder.
-- **Android** — install `app-debug.apk`; allow installation from your browser when asked.
-- **Linux** — extract the tarball and run `./DeepSeek Code`.
+DeepSeek's web chat is free but has no API. This drives a real logged-in session — a WebView
+on Android, a `WebContentsView` on desktop — and answers HTTP requests on `127.0.0.1`:
 
-Each release page lists the SHA-256 of its archive, and the same value sits in the matching
-folder here.
+```
+POST /coding/chat/completions        SSE stream
+POST /coding/chat/completions/full   one JSON body
+POST /chat/completions/last          the last reply, read back from the page
+GET  /status                         conversation URL, health
+POST /open                           move the page to a conversation
+POST /toggles                        DeepThink / Search
+```
+
+The interface is [chernuga.github.io/ZhiPu-Integration](https://chernuga.github.io/ZhiPu-Integration/),
+loaded by all three clients — so UI updates reach them without a new build.
+
+## Building from source
+
+**Android** — JDK 17+ and the Android SDK:
+
+```bash
+cd android
+echo "sdk.dir=/path/to/Android/Sdk" > local.properties   # gitignored
+./gradlew assembleDebug
+```
+
+**Windows / Linux** — Node 20+:
+
+```bash
+cd windows      # or linux
+npm install
+npx electron-builder --win dir     # --linux dir on Linux
+```
 
 ## First run
 
-Every client asks you to sign in to DeepSeek on its own tab — that session is what answers
-requests. Nothing is sent anywhere else.
+Each client asks you to sign in to DeepSeek on its own tab. That session is what answers
+requests; nothing is sent anywhere else.
 
-The interface they load is
-[chernuga.github.io/ZhiPu-Integration](https://chernuga.github.io/ZhiPu-Integration/), so UI
-updates reach all three clients without downloading a new build.
+## A note on access
+
+This automates a real DeepSeek session, which their terms describe as automated access.
+Driving a browser is closer to normal use than reimplementing their protocol, but neither is
+sanctioned. Use it on your own account, at a human pace.
+
+The direct-protocol approach — solving their proof-of-work and reusing a session token
+outside the browser — is **not** part of this build. It was removed after an account
+suspension; notes are in `windows/docs/webai2api-direct.md`.
+
+## License
+
+Personal project, no licence granted. Read it, learn from it; don't redistribute it as your
+own.

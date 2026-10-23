@@ -1,0 +1,11 @@
+# Dependencies and build output.
+node_modules/
+dist/
+
+# The portable data folder: cookies, the DeepSeek login, conversations and the
+# remembered chat URL all live here. It is per-machine state, and committing it
+# would put a session cookie in the repository.
+DeepSeekData/
+
+# Local scratch
+*.log

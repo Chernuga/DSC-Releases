@@ -2,7 +2,7 @@
 
 **Download:** [DeepSeekCode-win-x64.zip](https://github.com/Chernuga/DSC-Releases/releases/download/win-v1.1/DeepSeekCode-win-x64.zip) — 150.9 MB
 
-The archive is attached to the release rather than stored here, because GitHub rejects files over 100 MB.
+Attached to the release rather than stored here: GitHub rejects files over 100 MB.
 
 ## Installing
 
@@ -11,16 +11,24 @@ The archive is attached to the release rather than stored here, because GitHub r
 
 No installation, no administrator rights.
 
-**Cannot find the exe?** It is inside the extracted folder. If Windows opened the zip instead of extracting it, right-click the zip and choose *Extract All* first.
+**Cannot find the exe?** It is inside the extracted folder. If Windows opened the zip instead of extracting it, right-click and choose *Extract All* first.
 
 Windows may warn that the application is unsigned — choose **More info → Run anyway**.
 
 ## Verifying
 
-`SHA256.txt` in this folder holds the checksum of the current build:
+`SHA256.txt` holds the checksum of the current build:
 
 ```powershell
 Get-FileHash .\DeepSeekCode-win-x64.zip -Algorithm SHA256
 ```
 
-A mismatch means the download was corrupted or altered; download it again.
+## Building
+
+```bash
+npm install
+npx electron-builder --win dir
+```
+
+The source is in this folder. `main.js` runs the app, `api.js` serves the local API,
+`hook.js` is injected into the DeepSeek page, and `preload-ui.js` seeds the client.

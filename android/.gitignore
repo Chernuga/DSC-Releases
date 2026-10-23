@@ -1,0 +1,24 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Live bridge credentials - never commit
+.secrets.local
+BRIDGE-ACCESS.md
+worker/dist/
+worker/node_modules/
+
+# Wrangler cache holds the Cloudflare account id and owner email
+worker/.wrangler/

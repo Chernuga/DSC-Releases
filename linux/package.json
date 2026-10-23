@@ -1,0 +1,62 @@
+{
+  "name": "deepseek-code",
+  "private": true,
+  "version": "1.1.0",
+  "description": "DeepSeek Code for Linux. No Cloudflare Worker, no network hop.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --linux dir",
+    "dist:deb": "electron-builder --linux deb"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.deepseek.code",
+    "productName": "DeepSeek Code",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "api.js",
+      "config.js",
+      "hook.js",
+      "preload.js",
+      "preload-ui.js",
+      "preload-renderer.js",
+      "renderer/**/*",
+      "assets/icon.png",
+      "make_icon.py"
+    ],
+    "linux": {
+      "icon": "assets/icon.png",
+      "category": "Development",
+      "synopsis": "DeepSeek Code client",
+      "description": "Drives a real DeepSeek web session and serves it over an OpenAI-shaped API on loopback, with the client UI alongside it.",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "compression": "maximum"
+  }
+}
