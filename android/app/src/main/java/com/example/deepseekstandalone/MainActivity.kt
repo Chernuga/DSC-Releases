@@ -316,6 +316,16 @@ class MainActivity : ComponentActivity(), ServerHandler {
             return
         }
 
+        // The destination chosen for a file the page asked to save.
+        if (requestCode == WorkspaceBridge.SAVE_FILE_REQUEST) {
+            val uri = data?.data
+            val ok = resultCode == RESULT_OK && uri != null
+            workspaceBridge.onSavePicked(if (ok) uri else null, cancelled = !ok)
+            if (ok) logError("Saved to: ${uri}")
+            else logError("Save cancelled")
+            return
+        }
+
         // A file chooser opened from the page (an <input type=file>).
         fileChooserCallback?.let { cb ->
             fileChooserCallback = null

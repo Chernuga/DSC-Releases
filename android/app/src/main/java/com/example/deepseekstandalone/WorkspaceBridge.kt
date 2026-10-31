@@ -40,7 +40,9 @@ class WorkspaceBridge(private val activity: MainActivity) {
 
     companion object {
         const val PICK_FOLDER_REQUEST = 7001
-        /** How long the page waits for the user to choose a folder. */
+        /** Saving a file the page produced. */
+        const val SAVE_FILE_REQUEST = 7002
+        /** How long the page waits for the user to choose a folder or destination. */
         private const val PICK_TIMEOUT_SECONDS = 300L
     }
 
@@ -296,6 +298,92 @@ class WorkspaceBridge(private val activity: MainActivity) {
         } catch (e: Exception) {
             jsonError("Could not open $relativePath: ${e.message}")
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Saving a file the page produced
+    // ---------------------------------------------------------------------
+
+    /** Set while the save dialog is open, released when the user finishes. */
+    @Volatile
+    private var saveLatch: CountDownLatch? = null
+
+    @Volatile
+    private var saveResult: Uri? = null
+
+    @Volatile
+    private var saveCancelled: Boolean = false
+
+    /**
+     * Save text produced by the page to a location the user picks.
+     *
+     * The page cannot download anything by itself in a WebView: an anchor with a
+     * `download` attribute fires no download manager, so exports simply did nothing on
+     * Android while working in a browser. This asks the system for a destination and
+     * writes the bytes there.
+     *
+     * Blocks until the user finishes, like pickFolder - the page's JavaScript thread is
+     * not the UI thread, so this does not freeze anything.
+     *
+     * Returns {"ok":true,"name":...} or an error, as JSON text.
+     */
+    @JavascriptInterface
+    fun saveFile(filename: String, mimeType: String, contentBase64: String): String {
+        val latch = CountDownLatch(1)
+        saveLatch = latch
+        saveResult = null
+        saveCancelled = false
+
+        activity.runOnUiThread {
+            try {
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = mimeType.ifBlank { "application/octet-stream" }
+                    putExtra(Intent.EXTRA_TITLE, filename)
+                }
+                activity.startActivityForResult(intent, SAVE_FILE_REQUEST)
+            } catch (e: Exception) {
+                saveCancelled = true
+                latch.countDown()
+            }
+        }
+
+        val finished = latch.await(PICK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        saveLatch = null
+
+        if (!finished || saveCancelled || saveResult == null) {
+            return jsonError("Save was cancelled.")
+        }
+
+        val uri = saveResult!!
+        return try {
+            // "wt" truncates: without it, saving over an existing file leaves the tail of
+            // the old contents behind when the new one is shorter.
+            val out = activity.contentResolver.openOutputStream(uri, "wt")
+                ?: return jsonError("Could not open the destination for writing.")
+            out.use { it.write(Base64.decode(contentBase64, Base64.DEFAULT)) }
+            """{"ok":true,"name":${jsonString(queryDisplayName(uri) ?: filename)}}"""
+        } catch (e: Exception) {
+            jsonError("Could not write the file: ${e.message}")
+        }
+    }
+
+    /** The name the provider stored the file under, for reporting back. */
+    private fun queryDisplayName(uri: Uri): String? = try {
+        activity.contentResolver.query(
+            uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** Called by the activity when the save dialog returns. */
+    fun onSavePicked(uri: Uri?, cancelled: Boolean) {
+        saveResult = uri
+        saveCancelled = cancelled || uri == null
+        saveLatch?.countDown()
     }
 
     /** Called by the activity when the picker returns. */
