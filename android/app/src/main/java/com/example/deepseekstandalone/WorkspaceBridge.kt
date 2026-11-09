@@ -40,8 +40,16 @@ class WorkspaceBridge(private val activity: MainActivity) {
 
     companion object {
         const val PICK_FOLDER_REQUEST = 7001
-        /** Saving a file the page produced. */
-        const val SAVE_FILE_REQUEST = 7002
+        /**
+         * Saving a file the page produced.
+         *
+         * 7003, not 7002: 7002 is already MainActivity's file-chooser request, and
+         * onActivityResult tests this constant FIRST. Both were 7002, so every image a
+         * user picked from the gallery was delivered to this save handler and returned -
+         * the chooser callback never ran, the page never received the file, and attaching
+         * a photo on the phone simply did nothing. One code per dialog.
+         */
+        const val SAVE_FILE_REQUEST = 7003
         /** How long the page waits for the user to choose a folder or destination. */
         private const val PICK_TIMEOUT_SECONDS = 300L
     }

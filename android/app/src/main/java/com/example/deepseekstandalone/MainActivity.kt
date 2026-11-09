@@ -76,6 +76,8 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
     companion object {
         const val NOTIFICATION_PERMISSION_REQUEST = 9001
+        /** Runtime grant for reading images the page attaches. */
+        const val MEDIA_PERMISSION_REQUEST = 9002
         /** Result code for a file chooser opened from a page's <input type=file>. */
         const val FILE_CHOOSER_REQUEST = 7002
         const val DEEPSEEK_URL = "https://chat.deepseek.com"
@@ -134,6 +136,14 @@ class MainActivity : ComponentActivity(), ServerHandler {
     private var isServerRunningState by mutableStateOf(false)
     private var lastErrorState by mutableStateOf<String?>(null)
     private val errorLogList = mutableStateListOf<String>()
+
+    /**
+     * Whether the media permission has been asked for this process.
+     *
+     * Asked once: a refusal is final for the session, so re-prompting on every trip
+     * through startBridgeServices would nag without changing anything.
+     */
+    private var mediaPermissionAsked = false
 
     /** Live page counters, refreshed by the Controls page. */
     private var streamedChunksState by mutableStateOf(0)
@@ -548,6 +558,8 @@ class MainActivity : ComponentActivity(), ServerHandler {
         // Hold the process in the foreground so the WebView and the local server
         // keep working with the screen off.
         requestNotificationPermissionIfNeeded()
+        // Ask before the user tries to attach a photo, not after it fails.
+        requestMediaPermissionIfNeeded()
         BridgeService.start(this)
 
         try {
@@ -590,6 +602,36 @@ class MainActivity : ComponentActivity(), ServerHandler {
             PackageManager.PERMISSION_GRANTED
         if (!granted) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIFICATION_PERMISSION_REQUEST)
+        }
+    }
+
+    /**
+     * Ask for the media permission the page needs to attach an image.
+     *
+     * The manifest declared it, but declaring is not granting: on Android 13+ it is a
+     * runtime permission, so it was never actually held. The system picker usually hands
+     * back a URI that carries its own grant, which is why attaching a photo could work
+     * anyway - but anything that reads the gallery by permission rather than by grant
+     * failed silently, with the page showing an empty frame.
+     *
+     * Asked once, at startup, next to the notification prompt. A refusal is left alone:
+     * the picker still works through its per-URI grant, so the app degrades rather than
+     * nagging on every launch.
+     */
+    private fun requestMediaPermissionIfNeeded() {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+        val granted = checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+        if (granted) return
+        if (mediaPermissionAsked) return
+        mediaPermissionAsked = true
+        try {
+            requestPermissions(arrayOf(permission), MEDIA_PERMISSION_REQUEST)
+        } catch (e: Exception) {
+            logError("Could not request the media permission: ${e.message}")
         }
     }
 
