@@ -17,11 +17,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -32,6 +35,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -273,7 +277,24 @@ class MainActivity : ComponentActivity(), ServerHandler {
 
         setContent {
             MaterialTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    // The keyboard counts as content space.
+                    //
+                    // enableEdgeToEdge() puts the app behind the system bars, and from
+                    // that point the window is no longer resized for the keyboard -
+                    // windowSoftInputMode="adjustResize" stops applying. Scaffold only
+                    // insets the system bars by default, so the WebView stayed full
+                    // height and the keyboard was drawn straight over the bottom of it:
+                    // the composer's attach, refresh and send row disappeared under the
+                    // IME while Chrome, which resizes its own viewport, looked fine.
+                    //
+                    // Adding the IME inset to the scaffold's content window insets makes
+                    // the content area shrink when the keyboard opens, so the page
+                    // reflows exactly as it does in the browser.
+                    contentWindowInsets = ScaffoldDefaults.contentWindowInsets
+                        .union(WindowInsets.ime)
+                ) { innerPadding ->
                     StandaloneScreen(
                         modifier = Modifier.padding(innerPadding),
                         isApiEnabled = isApiEnabledState,
